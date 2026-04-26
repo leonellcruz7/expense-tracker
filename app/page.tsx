@@ -188,6 +188,9 @@ export default function Home() {
   const [editError, setEditError] = useState("");
   const [isAddDatePickerOpen, setIsAddDatePickerOpen] = useState(false);
   const [isEditDatePickerOpen, setIsEditDatePickerOpen] = useState(false);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [expandedBalanceItems, setExpandedBalanceItems] = useState<Record<string, boolean>>({});
+  const HISTORY_PAGE_SIZE = 10;
 
   const expenseForm = useForm<ExpenseFormValues>({
     resolver: zodResolver(expenseSchema),
@@ -407,6 +410,34 @@ export default function Home() {
       return { card, included, total: included.reduce((sum, line) => sum + line.amount, 0) };
     });
   }, [cards, expenses, selectedMonthKey]);
+  const cashBalance = useMemo(() => {
+    const included = expenses
+      .filter((item) => item.payment_type === "cash")
+      .flatMap((item) => {
+        const parsedDate = parseInputDate(formatDbDate(item.expense_date));
+        if (!parsedDate) return [];
+        const monthKey = `${parsedDate.getFullYear()}-${pad2(parsedDate.getMonth() + 1)}`;
+        if (monthKey !== selectedMonthKey) return [];
+        return [
+          {
+            id: item.id,
+            label: `${formatDbDate(item.expense_date)} - ${item.description}`,
+            amount: Number(item.amount),
+          },
+        ];
+      });
+
+    return {
+      included,
+      total: included.reduce((sum, line) => sum + line.amount, 0),
+    };
+  }, [expenses, selectedMonthKey]);
+  const historyTotalPages = Math.max(1, Math.ceil(expenses.length / HISTORY_PAGE_SIZE));
+  const currentHistoryPage = Math.min(historyPage, historyTotalPages);
+  const paginatedExpenses = useMemo(() => {
+    const start = (currentHistoryPage - 1) * HISTORY_PAGE_SIZE;
+    return expenses.slice(start, start + HISTORY_PAGE_SIZE);
+  }, [expenses, currentHistoryPage]);
 
   const handleLogin = async () => {
     setAuthError("");
@@ -690,7 +721,7 @@ export default function Home() {
 
               <Card>
                 <CardContent className="space-y-3 p-4">
-                  {expenses.map((item) => {
+                  {paginatedExpenses.map((item) => {
                     const cardName = cards.find((card) => card.id === item.card_id)?.name;
                     const isEditing = editingExpenseId === item.id;
                     return (
@@ -769,6 +800,24 @@ export default function Home() {
                   })}
                 </CardContent>
               </Card>
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-[#a1a8b3]">
+                  Page {currentHistoryPage} of {historyTotalPages}
+                </p>
+                <div className="flex gap-2">
+                  <Button variant="outline" size="sm" onClick={() => setHistoryPage((prev) => Math.max(1, prev - 1))} disabled={currentHistoryPage === 1}>
+                    Previous
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setHistoryPage((prev) => Math.min(historyTotalPages, prev + 1))}
+                    disabled={currentHistoryPage === historyTotalPages}
+                  >
+                    Next
+                  </Button>
+                </div>
+              </div>
             </div>
           )}
 
@@ -825,23 +874,74 @@ export default function Home() {
                   </SelectContent>
                 </Select>
 
+                <Card className="rounded-xl bg-[#1d212c]">
+                  <CardHeader><CardTitle>Cash</CardTitle></CardHeader>
+                  <CardContent className="space-y-2">
+                    <p className="text-sm text-[#a1a8b3]">{cashBalance.included.length} transaction{cashBalance.included.length === 1 ? "" : "s"}</p>
+                    <p className="text-xl font-semibold text-[#22c55e]">{formatCurrencySymbol(cashBalance.total, currencyCode)}</p>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        setExpandedBalanceItems((prev) => ({
+                          ...prev,
+                          cash: !prev.cash,
+                        }))
+                      }
+                    >
+                      {expandedBalanceItems.cash ? "Hide Transactions" : "Show Transactions"}
+                    </Button>
+                    {expandedBalanceItems.cash ? (
+                      <>
+                        <Separator />
+                        {cashBalance.included.length === 0 ? (
+                          <p className="text-sm text-[#a1a8b3]">No cash transactions in this month.</p>
+                        ) : (
+                          cashBalance.included.map((line) => (
+                            <div key={line.id} className="flex justify-between text-sm">
+                              <span>{line.label}</span>
+                              <span>{formatCurrencySymbol(line.amount, currencyCode)}</span>
+                            </div>
+                          ))
+                        )}
+                      </>
+                    ) : null}
+                  </CardContent>
+                </Card>
+
                 {monthlyBalances.map(({ card, included, total }) => (
                   <Card key={card.id} className="rounded-xl bg-[#1d212c]">
                     <CardHeader><CardTitle>{card.name}</CardTitle></CardHeader>
                     <CardContent className="space-y-2">
                       <p className="text-sm text-[#a1a8b3]">Cutoff day: {card.cutoff_day} • {included.length} transaction{included.length === 1 ? "" : "s"}</p>
                       <p className="text-xl font-semibold text-[#fb7185]">{formatCurrencySymbol(total, currencyCode)}</p>
-                      <Separator />
-                      {included.length === 0 ? (
-                        <p className="text-sm text-[#a1a8b3]">No transactions in this billing cycle.</p>
-                      ) : (
-                        included.map((line) => (
-                          <div key={line.id} className="flex justify-between text-sm">
-                            <span>{line.label}</span>
-                            <span>{formatCurrencySymbol(line.amount, currencyCode)}</span>
-                          </div>
-                        ))
-                      )}
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          setExpandedBalanceItems((prev) => ({
+                            ...prev,
+                            [card.id]: !prev[card.id],
+                          }))
+                        }
+                      >
+                        {expandedBalanceItems[card.id] ? "Hide Transactions" : "Show Transactions"}
+                      </Button>
+                      {expandedBalanceItems[card.id] ? (
+                        <>
+                          <Separator />
+                          {included.length === 0 ? (
+                            <p className="text-sm text-[#a1a8b3]">No transactions in this billing cycle.</p>
+                          ) : (
+                            included.map((line) => (
+                              <div key={line.id} className="flex justify-between text-sm">
+                                <span>{line.label}</span>
+                                <span>{formatCurrencySymbol(line.amount, currencyCode)}</span>
+                              </div>
+                            ))
+                          )}
+                        </>
+                      ) : null}
                     </CardContent>
                   </Card>
                 ))}
