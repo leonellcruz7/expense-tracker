@@ -777,8 +777,14 @@ export default function Home() {
               <p className="px-1 text-xs text-[#a1a8b3]">GENERAL</p>
               <Card>
                 <CardContent className="space-y-3 p-3">
-                  <Input placeholder="Card name" value={cardNameInput} onChange={(e) => cardForm.setValue("name", e.target.value)} />
-                  <Input className={SPINNERLESS_NUMBER_INPUT_CLASS} type="number" placeholder="Cutoff Day" value={String(cardCutoffInput ?? 1)} onChange={(e) => cardForm.setValue("cutoff_day", Number(e.target.value))} />
+                  <div className="space-y-1">
+                    <p className="text-xs text-[#a1a8b3]">Card Name</p>
+                    <Input placeholder="Card name" value={cardNameInput} onChange={(e) => cardForm.setValue("name", e.target.value)} />
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-xs text-[#a1a8b3]">Cutoff Day</p>
+                    <Input className={SPINNERLESS_NUMBER_INPUT_CLASS} type="number" placeholder="1-31" value={String(cardCutoffInput ?? 1)} onChange={(e) => cardForm.setValue("cutoff_day", Number(e.target.value))} />
+                  </div>
                 </CardContent>
               </Card>
               <Button className="w-full" onClick={cardForm.handleSubmit((values) => addCardMutation.mutate(values))}>Save Card</Button>
