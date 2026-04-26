@@ -3,10 +3,12 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  CalendarDays,
   ChartLine,
   ChevronLeft,
   CreditCard,
   History,
+  Pencil,
   PlusCircle,
   Settings,
   Trash2,
@@ -17,8 +19,11 @@ import { z } from "zod";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Calendar } from "@/components/ui/calendar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { hasSupabaseEnv, supabase } from "@/lib/supabase";
@@ -120,6 +125,24 @@ const formatCurrencySymbol = (value: number, code: "USD" | "PHP") =>
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(value)}`;
+const SPINNERLESS_NUMBER_INPUT_CLASS =
+  "[appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none";
+const formatAmountDisplay = (value: string) => {
+  const sanitized = value.replace(/[^\d.]/g, "");
+  const firstDotIndex = sanitized.indexOf(".");
+  const normalized =
+    firstDotIndex === -1 ? sanitized : `${sanitized.slice(0, firstDotIndex + 1)}${sanitized.slice(firstDotIndex + 1).replaceAll(".", "")}`;
+  const [integerPartRaw = "", decimalPartRaw = ""] = normalized.split(".");
+  const integerDigits = integerPartRaw.replace(/^0+(?=\d)/, "") || "0";
+  const formattedInteger = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(Number(integerDigits));
+  if (normalized.endsWith(".")) return `${formattedInteger}.`;
+  if (!normalized.includes(".")) return formattedInteger;
+  return `${formattedInteger}.${decimalPartRaw.slice(0, 2)}`;
+};
+const parseAmountDisplay = (value: string) => {
+  const parsed = Number.parseFloat(value.replaceAll(",", ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+};
 
 const getStatementMonthKey = (expenseDate: Date, cutoffDay: number) => {
   const statementDate = new Date(expenseDate.getFullYear(), expenseDate.getMonth(), 1);
@@ -156,6 +179,15 @@ export default function Home() {
   const [signupEmail, setSignupEmail] = useState("");
   const [signupPassword, setSignupPassword] = useState("");
   const [signupConfirmPassword, setSignupConfirmPassword] = useState("");
+  const [amountDisplay, setAmountDisplay] = useState("0");
+  const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null);
+  const [editDescription, setEditDescription] = useState("");
+  const [editDate, setEditDate] = useState("");
+  const [editAmountDisplay, setEditAmountDisplay] = useState("0");
+  const [editCardId, setEditCardId] = useState("");
+  const [editError, setEditError] = useState("");
+  const [isAddDatePickerOpen, setIsAddDatePickerOpen] = useState(false);
+  const [isEditDatePickerOpen, setIsEditDatePickerOpen] = useState(false);
 
   const expenseForm = useForm<ExpenseFormValues>({
     resolver: zodResolver(expenseSchema),
@@ -269,6 +301,7 @@ export default function Home() {
         tenureMonths: 12,
         monthsPaid: 0,
       });
+      setAmountDisplay("0");
       setFormError("");
     },
     onError: (error: Error) => setFormError(error.message),
@@ -293,6 +326,31 @@ export default function Home() {
       if (error) throw error;
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["expenses", profileUserId] }),
+  });
+  const updateExpenseMutation = useMutation({
+    mutationFn: async (values: { item: ExpenseType; description: string; amount: number; expenseDate: string; cardId: string }) => {
+      const monthlyAmount =
+        values.item.is_installment && values.item.installment_tenure_months
+          ? Number((values.amount / values.item.installment_tenure_months).toFixed(2))
+          : null;
+      const { error } = await supabase
+        .from("expenses")
+        .update({
+          description: values.description.trim(),
+          amount: Number(values.amount.toFixed(2)),
+          expense_date: values.expenseDate,
+          card_id: values.item.payment_type === "credit" ? values.cardId : null,
+          installment_monthly_amount: monthlyAmount,
+        })
+        .eq("id", values.item.id);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["expenses", profileUserId] });
+      setEditingExpenseId(null);
+      setEditError("");
+    },
+    onError: (error: Error) => setEditError(error.message),
   });
 
   const deleteCardMutation = useMutation({
@@ -400,11 +458,57 @@ export default function Home() {
   const cardNameInput = useWatch({ control: cardForm.control, name: "name" });
   const cardCutoffInput = useWatch({ control: cardForm.control, name: "cutoff_day" });
   const amount = Number(amountInput || 0);
+  const selectedExpenseDate = parseInputDate(dateInput);
   const tenure = Number(tenureInput || 0);
   const paid = Number(paidInput || 0);
   const computedMonthlyPayment = tenure > 0 ? amount / tenure : 0;
   const computedRemainingBalance = Math.max(amount - paid * computedMonthlyPayment, 0);
   const computedRemainingMonths = Math.max(tenure - paid, 0);
+  const editingDate = parseInputDate(editDate);
+
+  const startEditingExpense = (item: ExpenseType) => {
+    setEditingExpenseId(item.id);
+    setEditDescription(item.description);
+    setEditDate(formatDbDate(item.expense_date));
+    setEditAmountDisplay(formatAmountDisplay(String(item.amount)));
+    setEditCardId(item.card_id ?? "");
+    setEditError("");
+  };
+
+  const cancelEditingExpense = () => {
+    setEditingExpenseId(null);
+    setEditError("");
+  };
+
+  const saveEditingExpense = (item: ExpenseType) => {
+    const trimmedDescription = editDescription.trim();
+    if (!trimmedDescription) {
+      setEditError("Description is required.");
+      return;
+    }
+    const parsedAmount = parseAmountDisplay(editAmountDisplay);
+    if (parsedAmount <= 0) {
+      setEditError("Amount must be greater than 0.");
+      return;
+    }
+    const dbDate = toDbDate(editDate);
+    if (!dbDate) {
+      setEditError("Date must be valid.");
+      return;
+    }
+    if (item.payment_type === "credit" && !editCardId) {
+      setEditError("Select a credit card.");
+      return;
+    }
+    setEditError("");
+    updateExpenseMutation.mutate({
+      item,
+      description: trimmedDescription,
+      amount: parsedAmount,
+      expenseDate: dbDate,
+      cardId: editCardId,
+    });
+  };
 
   if (!hasSupabaseEnv) {
     return (
@@ -480,7 +584,17 @@ export default function Home() {
 
                   <div className="flex items-end gap-3">
                     <Button variant="outline" onClick={() => setCurrencyCode(currencyCode === "USD" ? "PHP" : "USD")}>{currencyCode}</Button>
-                    <Input className="h-16 text-right text-5xl font-bold text-[#ff4d4f]" value={String(amountInput ?? 0)} onChange={(e) => expenseForm.setValue("amount", Number(e.target.value || 0))} />
+                    <Input
+                      type="text"
+                      inputMode="decimal"
+                      className="h-16 text-right text-5xl font-bold text-[#ff4d4f]"
+                      value={amountDisplay}
+                      onChange={(e) => {
+                        const formatted = formatAmountDisplay(e.target.value);
+                        setAmountDisplay(formatted);
+                        expenseForm.setValue("amount", parseAmountDisplay(formatted), { shouldValidate: true });
+                      }}
+                    />
                   </div>
                 </CardContent>
               </Card>
@@ -488,15 +602,44 @@ export default function Home() {
               <p className="px-1 text-xs text-[#a1a8b3]">GENERAL</p>
               <Card>
                 <CardContent className="space-y-3 p-3">
-                  <Input value={dateInput} onChange={(e) => expenseForm.setValue("date", e.target.value)} placeholder="DD/MM/YYYY" />
+                  <Popover open={isAddDatePickerOpen} onOpenChange={setIsAddDatePickerOpen}>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="outline"
+                        className="w-full justify-start gap-2 text-left font-normal text-[#a1a8b3]"
+                      >
+                        <CalendarDays className="h-4 w-4 text-[#7d8596]" />
+                        {selectedExpenseDate ? formatInputDate(selectedExpenseDate) : "Pick a date"}
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent align="start" className="w-auto p-0">
+                      <Calendar
+                        mode="single"
+                        selected={selectedExpenseDate ?? undefined}
+                        onSelect={(date) => {
+                          if (!date) return;
+                          expenseForm.setValue("date", formatInputDate(date), { shouldValidate: true });
+                          setIsAddDatePickerOpen(false);
+                        }}
+                      />
+                    </PopoverContent>
+                  </Popover>
                   <Input value={descriptionInput} onChange={(e) => expenseForm.setValue("description", e.target.value)} placeholder="e.g. Groceries" />
                   {paymentType === "credit" && (
-                    <select className="h-10 w-full rounded-md bg-[#171a23] px-3 text-sm text-[#a1a8b3]" value={cardIdInput ?? ""} onChange={(e) => expenseForm.setValue("cardId", e.target.value)}>
-                      <option value="">Select Card</option>
+                    <Select
+                      value={cardIdInput || undefined}
+                      onValueChange={(value) => expenseForm.setValue("cardId", value === "__none__" ? "" : value)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select Card" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__none__">Select Card</SelectItem>
                       {cards.map((card) => (
-                        <option key={card.id} value={card.id}>{card.name}</option>
+                        <SelectItem key={card.id} value={card.id}>{card.name}</SelectItem>
                       ))}
-                    </select>
+                      </SelectContent>
+                    </Select>
                   )}
                 </CardContent>
               </Card>
@@ -509,8 +652,8 @@ export default function Home() {
                       <div className="flex items-center gap-2"><Switch checked={isInstallment} onCheckedChange={(value) => expenseForm.setValue("isInstallment", value)} /><span>Installment</span></div>
                       {isInstallment && (
                         <div className="space-y-3 text-sm text-[#a1a8b3]">
-                          <Input type="number" value={String(tenureInput ?? 12)} onChange={(e) => expenseForm.setValue("tenureMonths", Number(e.target.value))} placeholder="Tenure" />
-                          <Input type="number" value={String(paidInput ?? 0)} onChange={(e) => expenseForm.setValue("monthsPaid", Number(e.target.value))} placeholder="Paid" />
+                          <Input className={SPINNERLESS_NUMBER_INPUT_CLASS} type="number" value={String(tenureInput ?? 12)} onChange={(e) => expenseForm.setValue("tenureMonths", Number(e.target.value))} placeholder="Tenure" />
+                          <Input className={SPINNERLESS_NUMBER_INPUT_CLASS} type="number" value={String(paidInput ?? 0)} onChange={(e) => expenseForm.setValue("monthsPaid", Number(e.target.value))} placeholder="Paid" />
                           <p>Remaining Months: {computedRemainingMonths}</p>
                           <p>Monthly Payment: {formatCurrencySymbol(Number(computedMonthlyPayment.toFixed(2)), currencyCode)}</p>
                           <p>Remaining Balance: {formatCurrencySymbol(Number(computedRemainingBalance.toFixed(2)), currencyCode)}</p>
@@ -549,20 +692,78 @@ export default function Home() {
                 <CardContent className="space-y-3 p-4">
                   {expenses.map((item) => {
                     const cardName = cards.find((card) => card.id === item.card_id)?.name;
+                    const isEditing = editingExpenseId === item.id;
                     return (
                       <div key={item.id} className="rounded-xl border border-[#2a2f3a] bg-[#1d212c] p-4">
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex-1">
-                            <p className="font-semibold">{item.description}</p>
+                            {isEditing ? (
+                              <div className="space-y-2">
+                                <Input value={editDescription} onChange={(e) => setEditDescription(e.target.value)} placeholder="Description" />
+                                <Popover open={isEditDatePickerOpen} onOpenChange={setIsEditDatePickerOpen}>
+                                  <PopoverTrigger asChild>
+                                    <Button variant="outline" className="w-full justify-start gap-2 text-left font-normal text-[#a1a8b3]">
+                                      <CalendarDays className="h-4 w-4 text-[#7d8596]" />
+                                      {editingDate ? formatInputDate(editingDate) : "Pick a date"}
+                                    </Button>
+                                  </PopoverTrigger>
+                                  <PopoverContent align="start" className="w-auto p-0">
+                                    <Calendar
+                                      mode="single"
+                                      selected={editingDate ?? undefined}
+                                      onSelect={(date) => {
+                                        if (!date) return;
+                                        setEditDate(formatInputDate(date));
+                                        setIsEditDatePickerOpen(false);
+                                      }}
+                                    />
+                                  </PopoverContent>
+                                </Popover>
+                                <Input
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={editAmountDisplay}
+                                  onChange={(e) => setEditAmountDisplay(formatAmountDisplay(e.target.value))}
+                                  placeholder="Amount"
+                                />
+                                {item.payment_type === "credit" ? (
+                                  <Select value={editCardId || undefined} onValueChange={setEditCardId}>
+                                    <SelectTrigger>
+                                      <SelectValue placeholder="Select Card" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      {cards.map((card) => (
+                                        <SelectItem key={card.id} value={card.id}>{card.name}</SelectItem>
+                                      ))}
+                                    </SelectContent>
+                                  </Select>
+                                ) : null}
+                              </div>
+                            ) : (
+                              <p className="font-semibold">{item.description}</p>
+                            )}
                             <p className="text-sm text-[#a1a8b3]">{item.payment_type === "cash" ? "Cash" : cardName ?? "Credit Card"}</p>
                             {item.is_installment && item.installment_tenure_months ? <Badge>{Math.max(item.installment_tenure_months - item.installment_months_paid, 0)} left</Badge> : null}
                           </div>
                           <div className="text-right">
-                            <p className="font-semibold text-[#fb7185]">-{formatCurrencySymbol(Number(item.amount), currencyCode)}</p>
-                            <p className="text-sm text-[#a1a8b3]">{formatDbDate(item.expense_date)}</p>
-                            <button onClick={() => deleteExpenseMutation.mutate(item.id)} className="mt-1 text-[#fb7185]"><Trash2 className="h-4 w-4" /></button>
+                            {isEditing ? (
+                              <div className="space-y-2">
+                                <Button size="sm" onClick={() => saveEditingExpense(item)} disabled={updateExpenseMutation.isPending}>Save</Button>
+                                <Button size="sm" variant="outline" onClick={cancelEditingExpense}>Cancel</Button>
+                              </div>
+                            ) : (
+                              <>
+                                <p className="font-semibold text-[#fb7185]">-{formatCurrencySymbol(Number(item.amount), currencyCode)}</p>
+                                <p className="text-sm text-[#a1a8b3]">{formatDbDate(item.expense_date)}</p>
+                                <div className="mt-1 flex justify-end gap-2">
+                                  <button onClick={() => startEditingExpense(item)} className="text-[#a1a8b3]"><Pencil className="h-4 w-4" /></button>
+                                  <button onClick={() => deleteExpenseMutation.mutate(item.id)} className="text-[#fb7185]"><Trash2 className="h-4 w-4" /></button>
+                                </div>
+                              </>
+                            )}
                           </div>
                         </div>
+                        {isEditing && editError ? <p className="mt-2 text-sm text-[#fb7185]">{editError}</p> : null}
                       </div>
                     );
                   })}
@@ -577,7 +778,7 @@ export default function Home() {
               <Card>
                 <CardContent className="space-y-3 p-3">
                   <Input placeholder="Card name" value={cardNameInput} onChange={(e) => cardForm.setValue("name", e.target.value)} />
-                  <Input type="number" placeholder="Cutoff Day" value={String(cardCutoffInput ?? 1)} onChange={(e) => cardForm.setValue("cutoff_day", Number(e.target.value))} />
+                  <Input className={SPINNERLESS_NUMBER_INPUT_CLASS} type="number" placeholder="Cutoff Day" value={String(cardCutoffInput ?? 1)} onChange={(e) => cardForm.setValue("cutoff_day", Number(e.target.value))} />
                 </CardContent>
               </Card>
               <Button className="w-full" onClick={cardForm.handleSubmit((values) => addCardMutation.mutate(values))}>Save Card</Button>
@@ -607,11 +808,16 @@ export default function Home() {
             <Card>
               <CardContent className="space-y-3 p-4">
                 <p className="px-1 text-xs text-[#a1a8b3]">GENERAL</p>
-                <select className="h-10 w-full rounded-md bg-[#171a23] px-3 text-sm text-[#a1a8b3]" value={selectedMonthKey} onChange={(e) => setSelectedMonthKey(e.target.value)}>
+                <Select value={selectedMonthKey} onValueChange={setSelectedMonthKey}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
                   {monthChoices.map((choice) => (
-                    <option key={choice.key} value={choice.key}>{choice.label}</option>
+                    <SelectItem key={choice.key} value={choice.key}>{choice.label}</SelectItem>
                   ))}
-                </select>
+                  </SelectContent>
+                </Select>
 
                 {monthlyBalances.map(({ card, included, total }) => (
                   <Card key={card.id} className="rounded-xl bg-[#1d212c]">
