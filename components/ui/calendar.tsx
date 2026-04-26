@@ -28,7 +28,6 @@ function Calendar({
         nav_button_next: "static",
         table: "w-full border-collapse table-fixed",
         weekdays: "grid grid-cols-7 mb-1",
-        weekdays_row: "contents",
         weekday: "h-10 w-10 place-self-center text-center text-[0.8rem] font-medium uppercase tracking-wide text-[#7d8596]",
         head_row: "grid grid-cols-7",
         head_cell: "h-10 w-10 place-self-center text-center text-[0.8rem] font-medium uppercase tracking-wide text-[#7d8596]",
