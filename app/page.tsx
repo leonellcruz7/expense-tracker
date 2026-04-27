@@ -107,6 +107,11 @@ const formatDbDate = (value: string) => {
   const [year, month, day] = value.split("-").map(Number);
   return `${pad2(day)}-${pad2(month)}-${year}`.replaceAll("-", "/");
 };
+const formatHistoryDate = (value: string) => {
+  const [_, month, day] = value.split("-").map(Number);
+  if (!month || !day) return value;
+  return `${MONTH_NAMES[month - 1]} ${day}`;
+};
 const parseInputDate = (value: string) => {
   const [day, month, year] = value.split("/").map(Number);
   if (!day || !month || !year) return null;
@@ -127,6 +132,9 @@ const formatCurrencySymbol = (value: number, code: "USD" | "PHP") =>
   }).format(value)}`;
 const SPINNERLESS_NUMBER_INPUT_CLASS =
   "[appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none";
+const HISTORY_CARD_FILTER_ALL = "__all__";
+const HISTORY_CARD_FILTER_CASH = "__cash__";
+const HISTORY_MONTH_FILTER_ALL = "__all__";
 const formatAmountDisplay = (value: string) => {
   const sanitized = value.replace(/[^\d.]/g, "");
   const firstDotIndex = sanitized.indexOf(".");
@@ -189,6 +197,8 @@ export default function Home() {
   const [isAddDatePickerOpen, setIsAddDatePickerOpen] = useState(false);
   const [isEditDatePickerOpen, setIsEditDatePickerOpen] = useState(false);
   const [historyPage, setHistoryPage] = useState(1);
+  const [historyCardFilter, setHistoryCardFilter] = useState(HISTORY_CARD_FILTER_ALL);
+  const [historyMonthFilter, setHistoryMonthFilter] = useState(HISTORY_MONTH_FILTER_ALL);
   const [expandedBalanceItems, setExpandedBalanceItems] = useState<Record<string, boolean>>({});
   const HISTORY_PAGE_SIZE = 10;
 
@@ -386,7 +396,7 @@ export default function Home() {
             if (baseMonthKey === selectedMonthKey) {
               included.push({
                 id: item.id,
-                label: `${formatDbDate(item.expense_date)} - ${item.description}`,
+                label: `${formatHistoryDate(item.expense_date)} - ${item.description}`,
                 amount: Number(item.amount),
               });
             }
@@ -400,7 +410,7 @@ export default function Home() {
             if (cycleKey === selectedMonthKey) {
               included.push({
                 id: `${item.id}-${idx}`,
-                label: `${formatDbDate(item.expense_date)} - ${item.description} ${idx + 1}/${item.installment_tenure_months}`,
+                label: `${formatHistoryDate(item.expense_date)} - ${item.description} ${idx + 1}/${item.installment_tenure_months}`,
                 amount: Number(item.installment_monthly_amount),
               });
             }
@@ -421,7 +431,7 @@ export default function Home() {
         return [
           {
             id: item.id,
-            label: `${formatDbDate(item.expense_date)} - ${item.description}`,
+            label: `${formatHistoryDate(item.expense_date)} - ${item.description}`,
             amount: Number(item.amount),
           },
         ];
@@ -432,12 +442,47 @@ export default function Home() {
       total: included.reduce((sum, line) => sum + line.amount, 0),
     };
   }, [expenses, selectedMonthKey]);
-  const historyTotalPages = Math.max(1, Math.ceil(expenses.length / HISTORY_PAGE_SIZE));
+  const historyMonthOptions = useMemo(() => {
+    const seen = new Set<string>();
+    return expenses
+      .map((item) => item.expense_date.slice(0, 7))
+      .filter((key) => {
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .map((key) => {
+        const [year, month] = key.split("-").map(Number);
+        return {
+          key,
+          label: `${MONTH_NAMES[month - 1]} ${year}`,
+        };
+      });
+  }, [expenses]);
+  const filteredHistoryExpenses = useMemo(
+    () =>
+      expenses.filter((item) => {
+        const matchesCard =
+          historyCardFilter === HISTORY_CARD_FILTER_ALL
+            ? true
+            : historyCardFilter === HISTORY_CARD_FILTER_CASH
+              ? item.payment_type === "cash"
+              : item.card_id === historyCardFilter;
+        const matchesMonth = historyMonthFilter === HISTORY_MONTH_FILTER_ALL ? true : item.expense_date.startsWith(`${historyMonthFilter}-`);
+        return matchesCard && matchesMonth;
+      }),
+    [expenses, historyCardFilter, historyMonthFilter],
+  );
+  const historyTotalPages = Math.max(1, Math.ceil(filteredHistoryExpenses.length / HISTORY_PAGE_SIZE));
   const currentHistoryPage = Math.min(historyPage, historyTotalPages);
   const paginatedExpenses = useMemo(() => {
     const start = (currentHistoryPage - 1) * HISTORY_PAGE_SIZE;
-    return expenses.slice(start, start + HISTORY_PAGE_SIZE);
-  }, [expenses, currentHistoryPage]);
+    return filteredHistoryExpenses.slice(start, start + HISTORY_PAGE_SIZE);
+  }, [filteredHistoryExpenses, currentHistoryPage]);
+
+  useEffect(() => {
+    setHistoryPage(1);
+  }, [historyCardFilter, historyMonthFilter]);
 
   const handleLogin = async () => {
     setAuthError("");
@@ -603,7 +648,7 @@ export default function Home() {
           <Button variant="outline" size="icon" onClick={() => setShowSettings(true)}><Settings className="h-4 w-4" /></Button>
         </div>
 
-        <div className="flex-1 space-y-4 pb-4">
+        <div className="flex-1 space-y-4 pb-24">
           {tab === "add" && (
             <>
               <Card>
@@ -719,6 +764,36 @@ export default function Home() {
                 <Card className="bg-[#24172f]"><CardContent className="p-3"><p className="text-xs text-[#a1a8b3]">Credit Expenses</p><p className="text-[#a855f7]">{formatCurrencySymbol(totals.credit, currencyCode)}</p></CardContent></Card>
               </div>
 
+              <div className="grid grid-cols-2 gap-2">
+                <Select value={historyCardFilter} onValueChange={setHistoryCardFilter}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="All Cards" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={HISTORY_CARD_FILTER_ALL}>All Cards</SelectItem>
+                    <SelectItem value={HISTORY_CARD_FILTER_CASH}>Cash</SelectItem>
+                    {cards.map((card) => (
+                      <SelectItem key={card.id} value={card.id}>
+                        {card.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Select value={historyMonthFilter} onValueChange={setHistoryMonthFilter}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="All Months" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={HISTORY_MONTH_FILTER_ALL}>All Months</SelectItem>
+                    {historyMonthOptions.map((option) => (
+                      <SelectItem key={option.key} value={option.key}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
               <Card>
                 <CardContent className="space-y-3 p-4">
                   {paginatedExpenses.map((item) => {
@@ -785,7 +860,7 @@ export default function Home() {
                             ) : (
                               <>
                                 <p className="font-semibold text-[#fb7185]">-{formatCurrencySymbol(Number(item.amount), currencyCode)}</p>
-                                <p className="text-sm text-[#a1a8b3]">{formatDbDate(item.expense_date)}</p>
+                                <p className="text-sm text-[#a1a8b3]">{formatHistoryDate(item.expense_date)}</p>
                                 <div className="mt-1 flex justify-end gap-2">
                                   <button onClick={() => startEditingExpense(item)} className="text-[#a1a8b3]"><Pencil className="h-4 w-4" /></button>
                                   <button onClick={() => deleteExpenseMutation.mutate(item.id)} className="text-[#fb7185]"><Trash2 className="h-4 w-4" /></button>
@@ -950,17 +1025,21 @@ export default function Home() {
           )}
         </div>
 
-        <div className="rounded-full border border-[#2a2f3a] bg-[#171a23] px-4 py-2">
-          <div className="flex items-center justify-between">
-            {navItems.map((item) => {
-              const Icon = item.icon;
-              const active = tab === item.key;
-              return (
-                <button key={item.key} onClick={() => setTab(item.key)} className={`rounded-full p-2 ${active ? "bg-[#0b2b51]" : ""}`}>
-                  <Icon className={`h-6 w-6 ${active ? "text-[#0a84ff]" : "text-[#a1a8b3]"}`} />
-                </button>
-              );
-            })}
+        <div className="fixed inset-x-0 bottom-0 z-40">
+          <div className="mx-auto w-full max-w-2xl px-5 pb-3 pt-2">
+            <div className="rounded-full border border-[#2a2f3a] bg-[#171a23] px-4 py-2">
+              <div className="flex items-center justify-between">
+                {navItems.map((item) => {
+                  const Icon = item.icon;
+                  const active = tab === item.key;
+                  return (
+                    <button key={item.key} onClick={() => setTab(item.key)} className={`rounded-full p-2 ${active ? "bg-[#0b2b51]" : ""}`}>
+                      <Icon className={`h-6 w-6 ${active ? "text-[#0a84ff]" : "text-[#a1a8b3]"}`} />
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           </div>
         </div>
       </div>
