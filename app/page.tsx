@@ -1127,13 +1127,13 @@ export default function Home() {
                 <Card className="rounded-xl border-[#433119] bg-[#2a1f14]">
                   <CardContent className="space-y-1 p-5">
                     <p className="text-sm text-[#e5c38a]">All Cards Total Balance</p>
-                    <p className="text-3xl font-bold text-[#fbbf24]">{formatCurrencySymbol(allCardsTotalBalance, currencyCode)}</p>
+                    <p className="text-2xl font-bold text-[#fbbf24]">{formatCurrencySymbol(allCardsTotalBalance, currencyCode)}</p>
                   </CardContent>
                 </Card>
                 <Card className="rounded-xl border-[#2a2f3a] bg-[#1d212c]">
                   <CardContent className="space-y-1 p-5">
                     <p className="text-sm text-[#a1a8b3]">Total Installments</p>
-                    <p className="text-3xl font-bold text-[#60a5fa]">{formatCurrencySymbol(totalInstallmentsBalance, currencyCode)}</p>
+                    <p className="text-2xl font-bold text-[#60a5fa]">{formatCurrencySymbol(totalInstallmentsBalance, currencyCode)}</p>
                   </CardContent>
                 </Card>
               </div>
