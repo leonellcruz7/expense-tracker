@@ -49,6 +49,7 @@ type ExpenseType = {
   installment_tenure_months: number | null;
   installment_monthly_amount: number | null;
   installment_months_paid: number;
+  is_recurring: boolean;
 };
 
 const expenseSchema = z
@@ -59,6 +60,7 @@ const expenseSchema = z
     paymentType: z.enum(["cash", "credit"]),
     cardId: z.string().optional(),
     isInstallment: z.boolean(),
+    isRecurring: z.boolean(),
     tenureMonths: z.coerce.number().int().min(1).optional(),
     monthsPaid: z.coerce.number().int().min(0).optional(),
   })
@@ -73,6 +75,9 @@ const expenseSchema = z
       if ((data.monthsPaid ?? 0) > (data.tenureMonths ?? 0)) {
         ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Months paid cannot exceed tenure.", path: ["monthsPaid"] });
       }
+    }
+    if (data.isInstallment && data.isRecurring) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Choose installment or recurring, not both.", path: ["isRecurring"] });
     }
   });
 
@@ -187,6 +192,7 @@ export default function Home() {
   const [signupEmail, setSignupEmail] = useState("");
   const [signupPassword, setSignupPassword] = useState("");
   const [signupConfirmPassword, setSignupConfirmPassword] = useState("");
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
   const [amountDisplay, setAmountDisplay] = useState("0");
   const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null);
   const [editDescription, setEditDescription] = useState("");
@@ -195,6 +201,7 @@ export default function Home() {
   const [editCardId, setEditCardId] = useState("");
   const [editTenureMonths, setEditTenureMonths] = useState("0");
   const [editMonthsPaid, setEditMonthsPaid] = useState("0");
+  const [editIsRecurring, setEditIsRecurring] = useState(false);
   const [editingCardId, setEditingCardId] = useState<string | null>(null);
   const [editCardName, setEditCardName] = useState("");
   const [editCardCutoffDay, setEditCardCutoffDay] = useState("1");
@@ -204,6 +211,7 @@ export default function Home() {
   const [historyPage, setHistoryPage] = useState(1);
   const [historyCardFilter, setHistoryCardFilter] = useState(HISTORY_CARD_FILTER_ALL);
   const [historyMonthFilter, setHistoryMonthFilter] = useState(HISTORY_MONTH_FILTER_ALL);
+  const [balanceDetailType, setBalanceDetailType] = useState<"installments" | "recurring" | null>(null);
   const [expandedBalanceItems, setExpandedBalanceItems] = useState<Record<string, boolean>>({});
   const HISTORY_PAGE_SIZE = 10;
 
@@ -216,6 +224,7 @@ export default function Home() {
       paymentType: "cash",
       cardId: "",
       isInstallment: false,
+      isRecurring: false,
       tenureMonths: 12,
       monthsPaid: 0,
     },
@@ -271,7 +280,7 @@ export default function Home() {
       const { data, error } = await supabase
         .from("expenses")
         .select(
-          "id,description,amount,currency_code,expense_date,payment_type,card_id,is_installment,installment_tenure_months,installment_monthly_amount,installment_months_paid",
+          "id,description,amount,currency_code,expense_date,payment_type,card_id,is_installment,installment_tenure_months,installment_monthly_amount,installment_months_paid,is_recurring",
         )
         .order("created_at", { ascending: false });
       if (error) throw error;
@@ -301,6 +310,7 @@ export default function Home() {
         payment_type: parsed.paymentType,
         card_id: parsed.paymentType === "credit" ? parsed.cardId : null,
         is_installment: parsed.paymentType === "credit" && parsed.isInstallment,
+        is_recurring: parsed.paymentType === "credit" && parsed.isRecurring,
         installment_tenure_months: parsed.paymentType === "credit" && parsed.isInstallment ? parsed.tenureMonths : null,
         installment_monthly_amount: monthlyAmount,
         installment_months_paid: parsed.paymentType === "credit" && parsed.isInstallment ? parsed.monthsPaid : 0,
@@ -316,6 +326,7 @@ export default function Home() {
         paymentType: "cash",
         cardId: cards[0]?.id ?? "",
         isInstallment: false,
+        isRecurring: false,
         tenureMonths: 12,
         monthsPaid: 0,
       });
@@ -354,6 +365,7 @@ export default function Home() {
       cardId: string;
       tenureMonths: number;
       monthsPaid: number;
+      isRecurring: boolean;
     }) => {
       const monthlyAmount = values.item.is_installment ? Number((values.amount / values.tenureMonths).toFixed(2)) : null;
       const { error } = await supabase
@@ -363,6 +375,7 @@ export default function Home() {
           amount: Number(values.amount.toFixed(2)),
           expense_date: values.expenseDate,
           card_id: values.item.payment_type === "credit" ? values.cardId : null,
+          is_recurring: values.item.payment_type === "credit" ? values.isRecurring : false,
           installment_tenure_months: values.item.is_installment ? values.tenureMonths : null,
           installment_months_paid: values.item.is_installment ? values.monthsPaid : 0,
           installment_monthly_amount: monthlyAmount,
@@ -425,6 +438,16 @@ export default function Home() {
           const parsedDate = parseInputDate(formatDbDate(item.expense_date));
           if (!parsedDate) return;
           const baseMonthKey = getStatementMonthKey(parsedDate, card.cutoff_day);
+          if (item.is_recurring) {
+            if (baseMonthKey <= selectedMonthKey) {
+              included.push({
+                id: `${item.id}-${selectedMonthKey}`,
+                label: `${formatHistoryDate(item.expense_date)} - ${item.description} (Recurring)`,
+                amount: Number(item.amount),
+              });
+            }
+            return;
+          }
           if (!item.is_installment || !item.installment_tenure_months || !item.installment_monthly_amount) {
             if (baseMonthKey === selectedMonthKey) {
               included.push({
@@ -457,28 +480,61 @@ export default function Home() {
     () => monthlyBalances.reduce((sum, { total }) => sum + total, 0),
     [monthlyBalances],
   );
-  const totalInstallmentsBalance = useMemo(() => {
-    return cards.reduce((sumByCards, card) => {
-      const cardInstallments = expenses
+  const installmentBalanceItems = useMemo(() => {
+    return cards.flatMap((card) => {
+      return expenses
         .filter((item) => item.payment_type === "credit" && item.card_id === card.id && item.is_installment)
-        .reduce((sumByExpenses, item) => {
+        .flatMap((item) => {
           const parsedDate = parseInputDate(formatDbDate(item.expense_date));
-          if (!parsedDate || !item.installment_tenure_months || !item.installment_monthly_amount) return sumByExpenses;
+          if (!parsedDate || !item.installment_tenure_months || !item.installment_monthly_amount) return [];
           const baseMonthKey = getStatementMonthKey(parsedDate, card.cutoff_day);
           const [startYear, startMonth] = baseMonthKey.split("-").map(Number);
-          let dueForMonth = 0;
           for (let idx = item.installment_months_paid; idx < item.installment_tenure_months; idx += 1) {
             const cycleDate = new Date(startYear, startMonth - 1 + idx, 1);
             const cycleKey = `${cycleDate.getFullYear()}-${pad2(cycleDate.getMonth() + 1)}`;
             if (cycleKey === selectedMonthKey) {
-              dueForMonth += Number(item.installment_monthly_amount);
+              return [
+                {
+                  id: `${item.id}-${idx}`,
+                  expense: item,
+                  amount: Number(item.installment_monthly_amount),
+                  label: `${formatHistoryDate(item.expense_date)} - ${item.description} ${idx + 1}/${item.installment_tenure_months}`,
+                },
+              ];
             }
           }
-          return sumByExpenses + dueForMonth;
-        }, 0);
-      return sumByCards + cardInstallments;
-    }, 0);
+          return [];
+        });
+    });
   }, [cards, expenses, selectedMonthKey]);
+  const totalInstallmentsBalance = useMemo(
+    () => installmentBalanceItems.reduce((sum, item) => sum + item.amount, 0),
+    [installmentBalanceItems],
+  );
+  const recurringBalanceItems = useMemo(() => {
+    return cards.flatMap((card) => {
+      return expenses
+        .filter((item) => item.payment_type === "credit" && item.card_id === card.id && item.is_recurring)
+        .flatMap((item) => {
+          const parsedDate = parseInputDate(formatDbDate(item.expense_date));
+          if (!parsedDate) return [];
+          const baseMonthKey = getStatementMonthKey(parsedDate, card.cutoff_day);
+          if (baseMonthKey > selectedMonthKey) return [];
+          return [
+            {
+              id: `${item.id}-${selectedMonthKey}`,
+              expense: item,
+              amount: Number(item.amount),
+              label: `${formatHistoryDate(item.expense_date)} - ${item.description}`,
+            },
+          ];
+        });
+    });
+  }, [cards, expenses, selectedMonthKey]);
+  const totalRecurringBalance = useMemo(
+    () => recurringBalanceItems.reduce((sum, item) => sum + item.amount, 0),
+    [recurringBalanceItems],
+  );
   const cashBalance = useMemo(() => {
     const included = expenses
       .filter((item) => item.payment_type === "cash")
@@ -545,8 +601,13 @@ export default function Home() {
 
   const handleLogin = async () => {
     setAuthError("");
-    const { error } = await supabase.auth.signInWithPassword({ email: loginEmail.trim(), password: loginPassword });
-    if (error) setAuthError(error.message);
+    setIsAuthLoading(true);
+    try {
+      const { error } = await supabase.auth.signInWithPassword({ email: loginEmail.trim(), password: loginPassword });
+      if (error) setAuthError(error.message);
+    } finally {
+      setIsAuthLoading(false);
+    }
   };
 
   const handleSignup = async () => {
@@ -555,12 +616,17 @@ export default function Home() {
       return;
     }
     setAuthError("");
-    const { error } = await supabase.auth.signUp({
-      email: signupEmail.trim(),
-      password: signupPassword,
-      options: { data: { full_name: signupName.trim() } },
-    });
-    if (error) setAuthError(error.message);
+    setIsAuthLoading(true);
+    try {
+      const { error } = await supabase.auth.signUp({
+        email: signupEmail.trim(),
+        password: signupPassword,
+        options: { data: { full_name: signupName.trim() } },
+      });
+      if (error) setAuthError(error.message);
+    } finally {
+      setIsAuthLoading(false);
+    }
   };
 
   const handleSignOut = async () => {
@@ -584,6 +650,7 @@ export default function Home() {
 
   const paymentType = useWatch({ control: expenseForm.control, name: "paymentType" });
   const isInstallment = useWatch({ control: expenseForm.control, name: "isInstallment" });
+  const isRecurring = useWatch({ control: expenseForm.control, name: "isRecurring" });
   const amountInput = useWatch({ control: expenseForm.control, name: "amount" });
   const dateInput = useWatch({ control: expenseForm.control, name: "date" });
   const descriptionInput = useWatch({ control: expenseForm.control, name: "description" });
@@ -609,6 +676,7 @@ export default function Home() {
     setEditCardId(item.card_id ?? "");
     setEditTenureMonths(String(item.installment_tenure_months ?? 0));
     setEditMonthsPaid(String(item.installment_months_paid ?? 0));
+    setEditIsRecurring(item.is_recurring);
     setEditError("");
   };
 
@@ -677,6 +745,10 @@ export default function Home() {
         return;
       }
     }
+    if (item.is_installment && editIsRecurring) {
+      setEditError("Choose installment or recurring, not both.");
+      return;
+    }
     setEditError("");
     updateExpenseMutation.mutate({
       item,
@@ -686,6 +758,7 @@ export default function Home() {
       cardId: editCardId,
       tenureMonths: item.is_installment ? parsedTenure : 0,
       monthsPaid: item.is_installment ? parsedMonthsPaid : 0,
+      isRecurring: item.payment_type === "credit" ? editIsRecurring : false,
     });
   };
 
@@ -736,7 +809,9 @@ export default function Home() {
             </Card>
 
             {authError ? <p className="text-sm text-[#fb7185]">{authError}</p> : null}
-            <Button className="w-full bg-[#0a84ff]" onClick={authScreen === "login" ? handleLogin : handleSignup}>{authScreen === "login" ? "Login" : "Create Account"}</Button>
+            <Button className="w-full bg-[#0a84ff]" onClick={authScreen === "login" ? handleLogin : handleSignup} disabled={isAuthLoading}>
+              {isAuthLoading ? (authScreen === "login" ? "Logging in..." : "Creating account...") : authScreen === "login" ? "Login" : "Create Account"}
+            </Button>
           </div>
         )}
       </div>
@@ -828,7 +903,26 @@ export default function Home() {
                   <p className="px-1 text-xs text-[#a1a8b3]">MORE DETAIL</p>
                   <Card>
                     <CardContent className="space-y-3 p-3">
-                      <div className="flex items-center gap-2"><Switch checked={isInstallment} onCheckedChange={(value) => expenseForm.setValue("isInstallment", value)} /><span>Installment</span></div>
+                      <div className="flex items-center gap-2">
+                        <Switch
+                          checked={isInstallment}
+                          onCheckedChange={(value) => {
+                            expenseForm.setValue("isInstallment", value);
+                            if (value) expenseForm.setValue("isRecurring", false);
+                          }}
+                        />
+                        <span>Installment</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Switch
+                          checked={isRecurring}
+                          onCheckedChange={(value) => {
+                            expenseForm.setValue("isRecurring", value);
+                            if (value) expenseForm.setValue("isInstallment", false);
+                          }}
+                        />
+                        <span>Recurring (monthly)</span>
+                      </div>
                       {isInstallment && (
                         <div className="space-y-3 text-sm text-[#a1a8b3]">
                           <Input className={SPINNERLESS_NUMBER_INPUT_CLASS} type="number" value={String(tenureInput ?? 12)} onChange={(e) => expenseForm.setValue("tenureMonths", Number(e.target.value))} placeholder="Tenure" />
@@ -960,7 +1054,13 @@ export default function Home() {
                                     </Select>
                                   </div>
                                 ) : null}
-                                {item.is_installment ? (
+                                {item.payment_type === "credit" ? (
+                                  <div className="flex items-center gap-2">
+                                    <Switch checked={editIsRecurring} onCheckedChange={setEditIsRecurring} />
+                                    <span className="text-sm text-[#a1a8b3]">Recurring (monthly)</span>
+                                  </div>
+                                ) : null}
+                                {item.is_installment && !editIsRecurring ? (
                                   <div className="grid grid-cols-2 gap-2">
                                     <div className="space-y-1">
                                       <p className="text-xs text-[#a1a8b3]">Tenure (months)</p>
@@ -988,6 +1088,7 @@ export default function Home() {
                             )}
                             <p className="text-sm text-[#a1a8b3]">{item.payment_type === "cash" ? "Cash" : cardName ?? "Credit Card"}</p>
                             {item.is_installment && item.installment_tenure_months ? <Badge>{Math.max(item.installment_tenure_months - item.installment_months_paid, 0)} left</Badge> : null}
+                            {item.is_recurring ? <Badge>Recurring</Badge> : null}
                           </div>
                           <div className="text-right">
                             {isEditing ? (
@@ -1131,9 +1232,15 @@ export default function Home() {
                   </CardContent>
                 </Card>
                 <Card className="rounded-xl border-[#2a2f3a] bg-[#1d212c]">
-                  <CardContent className="space-y-1 p-5">
+                  <CardContent className="space-y-1 p-5 cursor-pointer" onClick={() => setBalanceDetailType("installments")}>
                     <p className="text-sm text-[#a1a8b3]">Total Installments</p>
                     <p className="text-2xl font-bold text-[#60a5fa]">{formatCurrencySymbol(totalInstallmentsBalance, currencyCode)}</p>
+                  </CardContent>
+                </Card>
+                <Card className="rounded-xl border-[#2a2f3a] bg-[#1d212c]">
+                  <CardContent className="space-y-1 p-5 cursor-pointer" onClick={() => setBalanceDetailType("recurring")}>
+                    <p className="text-sm text-[#a1a8b3]">Total Recurring</p>
+                    <p className="text-2xl font-bold text-[#34d399]">{formatCurrencySymbol(totalRecurringBalance, currencyCode)}</p>
                   </CardContent>
                 </Card>
               </div>
@@ -1270,6 +1377,114 @@ export default function Home() {
 
               <Button variant="destructive" className="w-full" onClick={handleSignOut}>Sign Out</Button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {balanceDetailType && (
+        <div className="fixed inset-0 z-50 bg-[#05070d]/95 px-5 py-4">
+          <div className="mx-auto max-w-2xl space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold">{balanceDetailType === "installments" ? "Installments" : "Recurring"} Details</h2>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setBalanceDetailType(null);
+                  setEditingExpenseId(null);
+                  setEditError("");
+                }}
+              >
+                Close
+              </Button>
+            </div>
+            <Card>
+              <CardContent className="space-y-3 p-4">
+                {(balanceDetailType === "installments" ? installmentBalanceItems : recurringBalanceItems).length === 0 ? (
+                  <p className="text-sm text-[#a1a8b3]">No items found for this month.</p>
+                ) : (
+                  (balanceDetailType === "installments" ? installmentBalanceItems : recurringBalanceItems).map((entry) => {
+                    const item = entry.expense;
+                    const isEditing = editingExpenseId === item.id;
+                    const cardName = cards.find((card) => card.id === item.card_id)?.name ?? "Credit Card";
+                    return (
+                      <div key={entry.id} className="rounded-xl border border-[#2a2f3a] bg-[#1d212c] p-4">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex-1">
+                            {isEditing ? (
+                              <div className="space-y-2">
+                                <div className="space-y-1">
+                                  <p className="text-xs text-[#a1a8b3]">Description</p>
+                                  <Input value={editDescription} onChange={(e) => setEditDescription(e.target.value)} />
+                                </div>
+                                <div className="space-y-1">
+                                  <p className="text-xs text-[#a1a8b3]">Amount</p>
+                                  <Input type="text" inputMode="decimal" value={editAmountDisplay} onChange={(e) => setEditAmountDisplay(formatAmountDisplay(e.target.value))} />
+                                </div>
+                                <div className="space-y-1">
+                                  <p className="text-xs text-[#a1a8b3]">Card</p>
+                                  <Select value={editCardId || undefined} onValueChange={setEditCardId}>
+                                    <SelectTrigger>
+                                      <SelectValue placeholder="Select Card" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      {cards.map((card) => (
+                                        <SelectItem key={card.id} value={card.id}>
+                                          {card.name}
+                                        </SelectItem>
+                                      ))}
+                                    </SelectContent>
+                                  </Select>
+                                </div>
+                                {item.is_installment && !editIsRecurring ? (
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <div className="space-y-1">
+                                      <p className="text-xs text-[#a1a8b3]">Tenure (months)</p>
+                                      <Input className={SPINNERLESS_NUMBER_INPUT_CLASS} type="number" value={editTenureMonths} onChange={(e) => setEditTenureMonths(e.target.value)} />
+                                    </div>
+                                    <div className="space-y-1">
+                                      <p className="text-xs text-[#a1a8b3]">Months Paid</p>
+                                      <Input className={SPINNERLESS_NUMBER_INPUT_CLASS} type="number" value={editMonthsPaid} onChange={(e) => setEditMonthsPaid(e.target.value)} />
+                                    </div>
+                                  </div>
+                                ) : null}
+                                <div className="flex gap-2">
+                                  <Button size="sm" onClick={() => saveEditingExpense(item)} disabled={updateExpenseMutation.isPending}>
+                                    Save
+                                  </Button>
+                                  <Button size="sm" variant="outline" onClick={cancelEditingExpense}>
+                                    Cancel
+                                  </Button>
+                                </div>
+                              </div>
+                            ) : (
+                              <>
+                                <p className="font-semibold">{item.description}</p>
+                                <p className="text-sm text-[#a1a8b3]">{cardName}</p>
+                                <p className="text-sm text-[#a1a8b3]">{entry.label}</p>
+                              </>
+                            )}
+                          </div>
+                          {!isEditing ? (
+                            <div className="text-right">
+                              <p className="font-semibold text-[#fb7185]">-{formatCurrencySymbol(entry.amount, currencyCode)}</p>
+                              <div className="mt-1 flex justify-end gap-2">
+                                <button onClick={() => startEditingExpense(item)} className="text-[#a1a8b3]">
+                                  <Pencil className="h-4 w-4" />
+                                </button>
+                                <button onClick={() => deleteExpenseMutation.mutate(item.id)} className="text-[#fb7185]">
+                                  <Trash2 className="h-4 w-4" />
+                                </button>
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
+                        {isEditing && editError ? <p className="mt-2 text-sm text-[#fb7185]">{editError}</p> : null}
+                      </div>
+                    );
+                  })
+                )}
+              </CardContent>
+            </Card>
           </div>
         </div>
       )}
