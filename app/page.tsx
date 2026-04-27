@@ -193,6 +193,11 @@ export default function Home() {
   const [editDate, setEditDate] = useState("");
   const [editAmountDisplay, setEditAmountDisplay] = useState("0");
   const [editCardId, setEditCardId] = useState("");
+  const [editTenureMonths, setEditTenureMonths] = useState("0");
+  const [editMonthsPaid, setEditMonthsPaid] = useState("0");
+  const [editingCardId, setEditingCardId] = useState<string | null>(null);
+  const [editCardName, setEditCardName] = useState("");
+  const [editCardCutoffDay, setEditCardCutoffDay] = useState("1");
   const [editError, setEditError] = useState("");
   const [isAddDatePickerOpen, setIsAddDatePickerOpen] = useState(false);
   const [isEditDatePickerOpen, setIsEditDatePickerOpen] = useState(false);
@@ -341,11 +346,16 @@ export default function Home() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["expenses", profileUserId] }),
   });
   const updateExpenseMutation = useMutation({
-    mutationFn: async (values: { item: ExpenseType; description: string; amount: number; expenseDate: string; cardId: string }) => {
-      const monthlyAmount =
-        values.item.is_installment && values.item.installment_tenure_months
-          ? Number((values.amount / values.item.installment_tenure_months).toFixed(2))
-          : null;
+    mutationFn: async (values: {
+      item: ExpenseType;
+      description: string;
+      amount: number;
+      expenseDate: string;
+      cardId: string;
+      tenureMonths: number;
+      monthsPaid: number;
+    }) => {
+      const monthlyAmount = values.item.is_installment ? Number((values.amount / values.tenureMonths).toFixed(2)) : null;
       const { error } = await supabase
         .from("expenses")
         .update({
@@ -353,6 +363,8 @@ export default function Home() {
           amount: Number(values.amount.toFixed(2)),
           expense_date: values.expenseDate,
           card_id: values.item.payment_type === "credit" ? values.cardId : null,
+          installment_tenure_months: values.item.is_installment ? values.tenureMonths : null,
+          installment_months_paid: values.item.is_installment ? values.monthsPaid : 0,
           installment_monthly_amount: monthlyAmount,
         })
         .eq("id", values.item.id);
@@ -376,10 +388,31 @@ export default function Home() {
       queryClient.invalidateQueries({ queryKey: ["expenses", profileUserId] });
     },
   });
+  const updateCardMutation = useMutation({
+    mutationFn: async (values: { id: string; name: string; cutoffDay: number }) => {
+      const parsed = cardSchema.parse({ name: values.name, cutoff_day: values.cutoffDay });
+      const { error } = await supabase.from("credit_cards").update({ name: parsed.name, cutoff_day: parsed.cutoff_day }).eq("id", values.id);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["cards", profileUserId] });
+      setEditingCardId(null);
+      setEditError("");
+    },
+    onError: (error: Error) => setEditError(error.message),
+  });
 
   const totals = useMemo(() => {
     const cash = expenses.filter((item) => item.payment_type === "cash").reduce((sum, item) => sum + Number(item.amount), 0);
     const credit = expenses.filter((item) => item.payment_type === "credit").reduce((sum, item) => sum + Number(item.amount), 0);
+    return { cash, credit, all: cash + credit };
+  }, [expenses]);
+  const currentMonthTotals = useMemo(() => {
+    const now = new Date();
+    const currentMonthKey = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}`;
+    const currentMonthExpenses = expenses.filter((item) => item.expense_date.startsWith(`${currentMonthKey}-`));
+    const cash = currentMonthExpenses.filter((item) => item.payment_type === "cash").reduce((sum, item) => sum + Number(item.amount), 0);
+    const credit = currentMonthExpenses.filter((item) => item.payment_type === "credit").reduce((sum, item) => sum + Number(item.amount), 0);
     return { cash, credit, all: cash + credit };
   }, [expenses]);
 
@@ -419,6 +452,32 @@ export default function Home() {
 
       return { card, included, total: included.reduce((sum, line) => sum + line.amount, 0) };
     });
+  }, [cards, expenses, selectedMonthKey]);
+  const allCardsTotalBalance = useMemo(
+    () => monthlyBalances.reduce((sum, { total }) => sum + total, 0),
+    [monthlyBalances],
+  );
+  const totalInstallmentsBalance = useMemo(() => {
+    return cards.reduce((sumByCards, card) => {
+      const cardInstallments = expenses
+        .filter((item) => item.payment_type === "credit" && item.card_id === card.id && item.is_installment)
+        .reduce((sumByExpenses, item) => {
+          const parsedDate = parseInputDate(formatDbDate(item.expense_date));
+          if (!parsedDate || !item.installment_tenure_months || !item.installment_monthly_amount) return sumByExpenses;
+          const baseMonthKey = getStatementMonthKey(parsedDate, card.cutoff_day);
+          const [startYear, startMonth] = baseMonthKey.split("-").map(Number);
+          let dueForMonth = 0;
+          for (let idx = item.installment_months_paid; idx < item.installment_tenure_months; idx += 1) {
+            const cycleDate = new Date(startYear, startMonth - 1 + idx, 1);
+            const cycleKey = `${cycleDate.getFullYear()}-${pad2(cycleDate.getMonth() + 1)}`;
+            if (cycleKey === selectedMonthKey) {
+              dueForMonth += Number(item.installment_monthly_amount);
+            }
+          }
+          return sumByExpenses + dueForMonth;
+        }, 0);
+      return sumByCards + cardInstallments;
+    }, 0);
   }, [cards, expenses, selectedMonthKey]);
   const cashBalance = useMemo(() => {
     const included = expenses
@@ -548,12 +607,38 @@ export default function Home() {
     setEditDate(formatDbDate(item.expense_date));
     setEditAmountDisplay(formatAmountDisplay(String(item.amount)));
     setEditCardId(item.card_id ?? "");
+    setEditTenureMonths(String(item.installment_tenure_months ?? 0));
+    setEditMonthsPaid(String(item.installment_months_paid ?? 0));
     setEditError("");
   };
 
   const cancelEditingExpense = () => {
     setEditingExpenseId(null);
     setEditError("");
+  };
+  const startEditingCard = (card: CreditCardType) => {
+    setEditingCardId(card.id);
+    setEditCardName(card.name);
+    setEditCardCutoffDay(String(card.cutoff_day));
+    setEditError("");
+  };
+  const cancelEditingCard = () => {
+    setEditingCardId(null);
+    setEditError("");
+  };
+  const saveEditingCard = (card: CreditCardType) => {
+    const trimmedName = editCardName.trim();
+    if (!trimmedName) {
+      setEditError("Card name is required.");
+      return;
+    }
+    const parsedCutoffDay = Number(editCardCutoffDay || 0);
+    if (!Number.isInteger(parsedCutoffDay) || parsedCutoffDay < 1 || parsedCutoffDay > 31) {
+      setEditError("Cutoff day must be between 1 and 31.");
+      return;
+    }
+    setEditError("");
+    updateCardMutation.mutate({ id: card.id, name: trimmedName, cutoffDay: parsedCutoffDay });
   };
 
   const saveEditingExpense = (item: ExpenseType) => {
@@ -576,6 +661,22 @@ export default function Home() {
       setEditError("Select a credit card.");
       return;
     }
+    const parsedTenure = Number(editTenureMonths || 0);
+    const parsedMonthsPaid = Number(editMonthsPaid || 0);
+    if (item.is_installment) {
+      if (!Number.isInteger(parsedTenure) || parsedTenure < 1) {
+        setEditError("Tenure must be at least 1.");
+        return;
+      }
+      if (!Number.isInteger(parsedMonthsPaid) || parsedMonthsPaid < 0) {
+        setEditError("Months paid must be 0 or more.");
+        return;
+      }
+      if (parsedMonthsPaid > parsedTenure) {
+        setEditError("Months paid cannot exceed tenure.");
+        return;
+      }
+    }
     setEditError("");
     updateExpenseMutation.mutate({
       item,
@@ -583,6 +684,8 @@ export default function Home() {
       amount: parsedAmount,
       expenseDate: dbDate,
       cardId: editCardId,
+      tenureMonths: item.is_installment ? parsedTenure : 0,
+      monthsPaid: item.is_installment ? parsedMonthsPaid : 0,
     });
   };
 
@@ -760,8 +863,9 @@ export default function Home() {
             <div className="space-y-3">
               <div className="grid grid-cols-2 gap-2">
                 <Card className="bg-[#1d212c]"><CardContent className="p-3"><p className="text-xs text-[#a1a8b3]">Total Expenses</p><p>{formatCurrencySymbol(totals.all, currencyCode)}</p></CardContent></Card>
+                <Card className="bg-[#1d212c]"><CardContent className="p-3"><p className="text-xs text-[#a1a8b3]">Total This Month</p><p>{formatCurrencySymbol(currentMonthTotals.all, currencyCode)}</p></CardContent></Card>
                 <Card className="bg-[#11261b]"><CardContent className="p-3"><p className="text-xs text-[#a1a8b3]">Cash Expenses</p><p className="text-[#22c55e]">{formatCurrencySymbol(totals.cash, currencyCode)}</p></CardContent></Card>
-                <Card className="bg-[#24172f]"><CardContent className="p-3"><p className="text-xs text-[#a1a8b3]">Credit Expenses</p><p className="text-[#a855f7]">{formatCurrencySymbol(totals.credit, currencyCode)}</p></CardContent></Card>
+                <Card className="bg-[#24172f]"><CardContent className="p-3"><p className="text-xs text-[#a1a8b3]">Credit This Month</p><p className="text-[#a855f7]">{formatCurrencySymbol(currentMonthTotals.credit, currencyCode)}</p></CardContent></Card>
               </div>
 
               <div className="grid grid-cols-2 gap-2">
@@ -805,7 +909,12 @@ export default function Home() {
                           <div className="flex-1">
                             {isEditing ? (
                               <div className="space-y-2">
-                                <Input value={editDescription} onChange={(e) => setEditDescription(e.target.value)} placeholder="Description" />
+                                <div className="space-y-1">
+                                  <p className="text-xs text-[#a1a8b3]">Description</p>
+                                  <Input value={editDescription} onChange={(e) => setEditDescription(e.target.value)} placeholder="Description" />
+                                </div>
+                                <div className="space-y-1">
+                                  <p className="text-xs text-[#a1a8b3]">Date</p>
                                 <Popover open={isEditDatePickerOpen} onOpenChange={setIsEditDatePickerOpen}>
                                   <PopoverTrigger asChild>
                                     <Button variant="outline" className="w-full justify-start gap-2 text-left font-normal text-[#a1a8b3]">
@@ -825,24 +934,53 @@ export default function Home() {
                                     />
                                   </PopoverContent>
                                 </Popover>
-                                <Input
-                                  type="text"
-                                  inputMode="decimal"
-                                  value={editAmountDisplay}
-                                  onChange={(e) => setEditAmountDisplay(formatAmountDisplay(e.target.value))}
-                                  placeholder="Amount"
-                                />
+                                </div>
+                                <div className="space-y-1">
+                                  <p className="text-xs text-[#a1a8b3]">Amount</p>
+                                  <Input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={editAmountDisplay}
+                                    onChange={(e) => setEditAmountDisplay(formatAmountDisplay(e.target.value))}
+                                    placeholder="Amount"
+                                  />
+                                </div>
                                 {item.payment_type === "credit" ? (
-                                  <Select value={editCardId || undefined} onValueChange={setEditCardId}>
-                                    <SelectTrigger>
-                                      <SelectValue placeholder="Select Card" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      {cards.map((card) => (
-                                        <SelectItem key={card.id} value={card.id}>{card.name}</SelectItem>
-                                      ))}
-                                    </SelectContent>
-                                  </Select>
+                                  <div className="space-y-1">
+                                    <p className="text-xs text-[#a1a8b3]">Card</p>
+                                    <Select value={editCardId || undefined} onValueChange={setEditCardId}>
+                                      <SelectTrigger>
+                                        <SelectValue placeholder="Select Card" />
+                                      </SelectTrigger>
+                                      <SelectContent>
+                                        {cards.map((card) => (
+                                          <SelectItem key={card.id} value={card.id}>{card.name}</SelectItem>
+                                        ))}
+                                      </SelectContent>
+                                    </Select>
+                                  </div>
+                                ) : null}
+                                {item.is_installment ? (
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <div className="space-y-1">
+                                      <p className="text-xs text-[#a1a8b3]">Tenure (months)</p>
+                                      <Input
+                                        className={SPINNERLESS_NUMBER_INPUT_CLASS}
+                                        type="number"
+                                        value={editTenureMonths}
+                                        onChange={(e) => setEditTenureMonths(e.target.value)}
+                                      />
+                                    </div>
+                                    <div className="space-y-1">
+                                      <p className="text-xs text-[#a1a8b3]">Months Paid</p>
+                                      <Input
+                                        className={SPINNERLESS_NUMBER_INPUT_CLASS}
+                                        type="number"
+                                        value={editMonthsPaid}
+                                        onChange={(e) => setEditMonthsPaid(e.target.value)}
+                                      />
+                                    </div>
+                                  </div>
                                 ) : null}
                               </div>
                             ) : (
@@ -922,9 +1060,42 @@ export default function Home() {
                     cards.map((card, index) => (
                       <div key={card.id}>
                         <div className="flex items-center justify-between p-3">
-                          <div><p>{card.name}</p><p className="text-sm text-[#a1a8b3]">Cutoff day {card.cutoff_day}</p></div>
-                          <Button variant="destructive" size="icon" onClick={() => deleteCardMutation.mutate(card.id)}><Trash2 className="h-4 w-4" /></Button>
+                          {editingCardId === card.id ? (
+                            <div className="flex w-full flex-col gap-2">
+                              <div className="space-y-1">
+                                <p className="text-xs text-[#a1a8b3]">Card Name</p>
+                                <Input value={editCardName} onChange={(e) => setEditCardName(e.target.value)} />
+                              </div>
+                              <div className="space-y-1">
+                                <p className="text-xs text-[#a1a8b3]">Cutoff Day</p>
+                                <Input
+                                  className={SPINNERLESS_NUMBER_INPUT_CLASS}
+                                  type="number"
+                                  value={editCardCutoffDay}
+                                  onChange={(e) => setEditCardCutoffDay(e.target.value)}
+                                />
+                              </div>
+                              <div className="flex gap-2">
+                                <Button size="sm" onClick={() => saveEditingCard(card)} disabled={updateCardMutation.isPending}>Save</Button>
+                                <Button size="sm" variant="outline" onClick={cancelEditingCard}>Cancel</Button>
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              <div>
+                                <p>{card.name}</p>
+                                <p className="text-sm text-[#a1a8b3]">Cutoff day {card.cutoff_day}</p>
+                              </div>
+                              <div className="flex gap-2">
+                                <Button variant="outline" size="icon" onClick={() => startEditingCard(card)}>
+                                  <Pencil className="h-4 w-4" />
+                                </Button>
+                                <Button variant="destructive" size="icon" onClick={() => deleteCardMutation.mutate(card.id)}><Trash2 className="h-4 w-4" /></Button>
+                              </div>
+                            </>
+                          )}
                         </div>
+                        {editingCardId === card.id && editError ? <p className="px-3 pb-2 text-sm text-[#fb7185]">{editError}</p> : null}
                         {index !== cards.length - 1 ? <Separator /> : null}
                       </div>
                     ))
@@ -935,80 +1106,66 @@ export default function Home() {
           )}
 
           {tab === "balances" && (
-            <Card>
-              <CardContent className="space-y-3 p-4">
-                <p className="px-1 text-xs text-[#a1a8b3]">GENERAL</p>
-                <Select value={selectedMonthKey} onValueChange={setSelectedMonthKey}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                  {monthChoices.map((choice) => (
-                    <SelectItem key={choice.key} value={choice.key}>{choice.label}</SelectItem>
-                  ))}
-                  </SelectContent>
-                </Select>
+            <div className="space-y-3">
+              <Card>
+                <CardContent className="space-y-3 p-4">
+                  <p className="px-1 text-xs text-[#a1a8b3]">MONTH FILTER</p>
+                  <Select value={selectedMonthKey} onValueChange={setSelectedMonthKey}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                    {monthChoices.map((choice) => (
+                      <SelectItem key={choice.key} value={choice.key}>{choice.label}</SelectItem>
+                    ))}
+                    </SelectContent>
+                  </Select>
+                </CardContent>
+              </Card>
 
-                <Card className="rounded-xl bg-[#1d212c]">
-                  <CardHeader><CardTitle>Cash</CardTitle></CardHeader>
-                  <CardContent className="space-y-2">
-                    <p className="text-sm text-[#a1a8b3]">{cashBalance.included.length} transaction{cashBalance.included.length === 1 ? "" : "s"}</p>
-                    <p className="text-xl font-semibold text-[#22c55e]">{formatCurrencySymbol(cashBalance.total, currencyCode)}</p>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() =>
-                        setExpandedBalanceItems((prev) => ({
-                          ...prev,
-                          cash: !prev.cash,
-                        }))
-                      }
-                    >
-                      {expandedBalanceItems.cash ? "Hide Transactions" : "Show Transactions"}
-                    </Button>
-                    {expandedBalanceItems.cash ? (
-                      <>
-                        <Separator />
-                        {cashBalance.included.length === 0 ? (
-                          <p className="text-sm text-[#a1a8b3]">No cash transactions in this month.</p>
-                        ) : (
-                          cashBalance.included.map((line) => (
-                            <div key={line.id} className="flex justify-between text-sm">
-                              <span>{line.label}</span>
-                              <span>{formatCurrencySymbol(line.amount, currencyCode)}</span>
-                            </div>
-                          ))
-                        )}
-                      </>
-                    ) : null}
+              <div className="grid grid-cols-2 gap-2">
+                <Card className="rounded-xl border-[#433119] bg-[#2a1f14]">
+                  <CardContent className="space-y-1 p-5">
+                    <p className="text-sm text-[#e5c38a]">All Cards Total Balance</p>
+                    <p className="text-3xl font-bold text-[#fbbf24]">{formatCurrencySymbol(allCardsTotalBalance, currencyCode)}</p>
                   </CardContent>
                 </Card>
+                <Card className="rounded-xl border-[#2a2f3a] bg-[#1d212c]">
+                  <CardContent className="space-y-1 p-5">
+                    <p className="text-sm text-[#a1a8b3]">Total Installments</p>
+                    <p className="text-3xl font-bold text-[#60a5fa]">{formatCurrencySymbol(totalInstallmentsBalance, currencyCode)}</p>
+                  </CardContent>
+                </Card>
+              </div>
 
-                {monthlyBalances.map(({ card, included, total }) => (
-                  <Card key={card.id} className="rounded-xl bg-[#1d212c]">
-                    <CardHeader><CardTitle>{card.name}</CardTitle></CardHeader>
+              <Card>
+                <CardContent className="space-y-3 p-4">
+                  <p className="px-1 text-xs text-[#a1a8b3]">GENERAL</p>
+
+                  <Card className="rounded-xl bg-[#1d212c]">
+                    <CardHeader><CardTitle>Cash</CardTitle></CardHeader>
                     <CardContent className="space-y-2">
-                      <p className="text-sm text-[#a1a8b3]">Cutoff day: {card.cutoff_day} • {included.length} transaction{included.length === 1 ? "" : "s"}</p>
-                      <p className="text-xl font-semibold text-[#fb7185]">{formatCurrencySymbol(total, currencyCode)}</p>
+                      <p className="text-sm text-[#a1a8b3]">{cashBalance.included.length} transaction{cashBalance.included.length === 1 ? "" : "s"}</p>
+                      <p className="text-xl font-semibold text-[#22c55e]">{formatCurrencySymbol(cashBalance.total, currencyCode)}</p>
                       <Button
                         variant="outline"
                         size="sm"
                         onClick={() =>
                           setExpandedBalanceItems((prev) => ({
                             ...prev,
-                            [card.id]: !prev[card.id],
+                            cash: !prev.cash,
                           }))
                         }
                       >
-                        {expandedBalanceItems[card.id] ? "Hide Transactions" : "Show Transactions"}
+                        {expandedBalanceItems.cash ? "Hide Transactions" : "Show Transactions"}
                       </Button>
-                      {expandedBalanceItems[card.id] ? (
+                      {expandedBalanceItems.cash ? (
                         <>
                           <Separator />
-                          {included.length === 0 ? (
-                            <p className="text-sm text-[#a1a8b3]">No transactions in this billing cycle.</p>
+                          {cashBalance.included.length === 0 ? (
+                            <p className="text-sm text-[#a1a8b3]">No cash transactions in this month.</p>
                           ) : (
-                            included.map((line) => (
+                            cashBalance.included.map((line) => (
                               <div key={line.id} className="flex justify-between text-sm">
                                 <span>{line.label}</span>
                                 <span>{formatCurrencySymbol(line.amount, currencyCode)}</span>
@@ -1019,9 +1176,46 @@ export default function Home() {
                       ) : null}
                     </CardContent>
                   </Card>
-                ))}
-              </CardContent>
-            </Card>
+
+                  {monthlyBalances.map(({ card, included, total }) => (
+                    <Card key={card.id} className="rounded-xl bg-[#1d212c]">
+                      <CardHeader><CardTitle>{card.name}</CardTitle></CardHeader>
+                      <CardContent className="space-y-2">
+                        <p className="text-sm text-[#a1a8b3]">Cutoff day: {card.cutoff_day} • {included.length} transaction{included.length === 1 ? "" : "s"}</p>
+                        <p className="text-xl font-semibold text-[#fb7185]">{formatCurrencySymbol(total, currencyCode)}</p>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() =>
+                            setExpandedBalanceItems((prev) => ({
+                              ...prev,
+                              [card.id]: !prev[card.id],
+                            }))
+                          }
+                        >
+                          {expandedBalanceItems[card.id] ? "Hide Transactions" : "Show Transactions"}
+                        </Button>
+                        {expandedBalanceItems[card.id] ? (
+                          <>
+                            <Separator />
+                            {included.length === 0 ? (
+                              <p className="text-sm text-[#a1a8b3]">No transactions in this billing cycle.</p>
+                            ) : (
+                              included.map((line) => (
+                                <div key={line.id} className="flex justify-between text-sm">
+                                  <span>{line.label}</span>
+                                  <span>{formatCurrencySymbol(line.amount, currencyCode)}</span>
+                                </div>
+                              ))
+                            )}
+                          </>
+                        ) : null}
+                      </CardContent>
+                    </Card>
+                  ))}
+                </CardContent>
+              </Card>
+            </div>
           )}
         </div>
 
