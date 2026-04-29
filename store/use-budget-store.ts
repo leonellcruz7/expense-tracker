@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-export type TabKey = "add" | "history" | "cards" | "balances";
+export type TabKey = "add" | "history" | "cards" | "balances" | "analysis";
 export type AuthScreen = "landing" | "login" | "signup" | "app";
 
 type BudgetStore = {

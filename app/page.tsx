@@ -8,12 +8,14 @@ import {
   ChevronLeft,
   CreditCard,
   History,
+  Loader2,
   Pencil,
   PlusCircle,
   Settings,
+  Sparkles,
   Trash2,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { z } from "zod";
 
@@ -50,6 +52,18 @@ type ExpenseType = {
   installment_monthly_amount: number | null;
   installment_months_paid: number;
   is_recurring: boolean;
+};
+
+type SpendingAnalysisResponse = {
+  analysis: string;
+  source?: string;
+};
+type AnalysisRecord = {
+  id: string;
+  period: "weekly" | "monthly";
+  analysis: string;
+  source: string | null;
+  created_at: string;
 };
 
 const expenseSchema = z
@@ -105,6 +119,7 @@ const MONTH_NAMES = [
 
 const EMPTY_CARDS: CreditCardType[] = [];
 const EMPTY_EXPENSES: ExpenseType[] = [];
+const EMPTY_ANALYSES: AnalysisRecord[] = [];
 
 const pad2 = (value: number) => String(value).padStart(2, "0");
 const formatInputDate = (date: Date) => `${pad2(date.getDate())}/${pad2(date.getMonth() + 1)}/${date.getFullYear()}`;
@@ -113,12 +128,19 @@ const formatDbDate = (value: string) => {
   return `${pad2(day)}-${pad2(month)}-${year}`.replaceAll("-", "/");
 };
 const formatHistoryDate = (value: string) => {
-  const [_, month, day] = value.split("-").map(Number);
+  const [, month, day] = value.split("-").map(Number);
   if (!month || !day) return value;
   return `${MONTH_NAMES[month - 1]} ${day}`;
 };
 const parseInputDate = (value: string) => {
   const [day, month, year] = value.split("/").map(Number);
+  if (!day || !month || !year) return null;
+  const parsed = new Date(year, month - 1, day);
+  if (parsed.getFullYear() !== year || parsed.getMonth() !== month - 1 || parsed.getDate() !== day) return null;
+  return parsed;
+};
+const parseDbDate = (value: string) => {
+  const [year, month, day] = value.split("-").map(Number);
   if (!day || !month || !year) return null;
   const parsed = new Date(year, month - 1, day);
   if (parsed.getFullYear() !== year || parsed.getMonth() !== month - 1 || parsed.getDate() !== day) return null;
@@ -140,6 +162,7 @@ const SPINNERLESS_NUMBER_INPUT_CLASS =
 const HISTORY_CARD_FILTER_ALL = "__all__";
 const HISTORY_CARD_FILTER_CASH = "__cash__";
 const HISTORY_MONTH_FILTER_ALL = "__all__";
+const ANALYSIS_HISTORY_FILTER_ALL = "__all__";
 const formatAmountDisplay = (value: string) => {
   const sanitized = value.replace(/[^\d.]/g, "");
   const firstDotIndex = sanitized.indexOf(".");
@@ -172,6 +195,29 @@ const monthOptions = () => {
   }
   return options;
 };
+const getWeekStart = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate() - date.getDay());
+const getWeekEnd = (date: Date) => {
+  const start = getWeekStart(date);
+  return new Date(start.getFullYear(), start.getMonth(), start.getDate() + 6, 23, 59, 59, 999);
+};
+const toDateKey = (date: Date) => `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+const isLastDayOfMonth = (date: Date) => date.getDate() === new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+const AnalysisResultSkeleton = () => (
+  <div className="space-y-3">
+    <div className="h-4 w-1/3 animate-pulse rounded bg-[#2a2f3a]" />
+    <div className="space-y-2 rounded-xl border border-[#2a2f3a] bg-[#1d212c] p-3">
+      <div className="h-3 w-5/6 animate-pulse rounded bg-[#2a2f3a]" />
+      <div className="h-3 w-4/6 animate-pulse rounded bg-[#2a2f3a]" />
+      <div className="h-3 w-3/6 animate-pulse rounded bg-[#2a2f3a]" />
+    </div>
+    <div className="space-y-2 rounded-xl border border-[#2a2f3a] bg-[#1d212c] p-3">
+      <div className="h-3 w-4/6 animate-pulse rounded bg-[#2a2f3a]" />
+      <div className="h-3 w-5/6 animate-pulse rounded bg-[#2a2f3a]" />
+      <div className="h-3 w-2/6 animate-pulse rounded bg-[#2a2f3a]" />
+    </div>
+  </div>
+);
+const isTimestampWithinRange = (valueMs: number, startMs: number, endMs: number) => valueMs >= startMs && valueMs <= endMs;
 
 export default function Home() {
   const queryClient = useQueryClient();
@@ -213,7 +259,87 @@ export default function Home() {
   const [historyMonthFilter, setHistoryMonthFilter] = useState(HISTORY_MONTH_FILTER_ALL);
   const [balanceDetailType, setBalanceDetailType] = useState<"installments" | "recurring" | null>(null);
   const [expandedBalanceItems, setExpandedBalanceItems] = useState<Record<string, boolean>>({});
+  const [analysisResult, setAnalysisResult] = useState("");
+  const [analysisError, setAnalysisError] = useState("");
+  const [displayedAnalysis, setDisplayedAnalysis] = useState("");
+  const [isTypingAnalysis, setIsTypingAnalysis] = useState(false);
+  const [analysisHistoryFilter, setAnalysisHistoryFilter] = useState<"__all__" | "weekly" | "monthly">(ANALYSIS_HISTORY_FILTER_ALL);
+  const [selectedAnalysisId, setSelectedAnalysisId] = useState<string>("");
+  const [analysisSaveError, setAnalysisSaveError] = useState("");
+  const [activeAnalysisPeriod, setActiveAnalysisPeriod] = useState<"weekly" | "monthly" | null>(null);
+  const analysisTypingTimerRef = useRef<number | null>(null);
+  const didHydrateAnalysisRef = useRef(false);
   const HISTORY_PAGE_SIZE = 10;
+  const now = new Date();
+  const isSunday = now.getDay() === 0;
+  const isMonthEnd = isLastDayOfMonth(now);
+
+  const startAnalysisTyping = (text: string) => {
+    if (analysisTypingTimerRef.current) {
+      window.clearInterval(analysisTypingTimerRef.current);
+      analysisTypingTimerRef.current = null;
+    }
+    setDisplayedAnalysis("");
+    setIsTypingAnalysis(true);
+
+    let cursor = 0;
+    const chunkSize = 8;
+    analysisTypingTimerRef.current = window.setInterval(() => {
+      cursor = Math.min(cursor + chunkSize, text.length);
+      setDisplayedAnalysis(text.slice(0, cursor));
+      if (cursor >= text.length) {
+        if (analysisTypingTimerRef.current) {
+          window.clearInterval(analysisTypingTimerRef.current);
+          analysisTypingTimerRef.current = null;
+        }
+        setIsTypingAnalysis(false);
+      }
+    }, 18);
+  };
+
+  useEffect(
+    () => () => {
+      if (analysisTypingTimerRef.current) {
+        window.clearInterval(analysisTypingTimerRef.current);
+      }
+    },
+    [],
+  );
+
+  const cleanAnalysisLine = (line: string) => line.replaceAll("**", "").replace(/^[-*]\s+/, "").trim();
+  const parsedAnalysisSections = useMemo(() => {
+    const lines = displayedAnalysis.split("\n");
+    const sections: { title: string; bullets: string[]; paragraphs: string[] }[] = [];
+    let current: { title: string; bullets: string[]; paragraphs: string[] } | null = null;
+
+    const pushCurrent = () => {
+      if (!current) return;
+      if (current.title || current.bullets.length > 0 || current.paragraphs.length > 0) {
+        sections.push(current);
+      }
+      current = null;
+    };
+
+    lines.forEach((rawLine) => {
+      const line = rawLine.trim();
+      if (!line) return;
+      const headingMatch = line.match(/^(#{1,6}\s*|\d+\)\s*)(.+)$/);
+      if (headingMatch) {
+        pushCurrent();
+        current = { title: cleanAnalysisLine(headingMatch[2]), bullets: [], paragraphs: [] };
+        return;
+      }
+      if (!current) current = { title: "", bullets: [], paragraphs: [] };
+      if (line.startsWith("- ") || line.startsWith("* ")) {
+        current.bullets.push(cleanAnalysisLine(line));
+      } else {
+        current.paragraphs.push(cleanAnalysisLine(line));
+      }
+    });
+
+    pushCurrent();
+    return sections;
+  }, [displayedAnalysis]);
 
   const expenseForm = useForm<ExpenseFormValues>({
     resolver: zodResolver(expenseSchema),
@@ -290,6 +416,65 @@ export default function Home() {
 
   const cards = cardsQuery.data ?? EMPTY_CARDS;
   const expenses = expensesQuery.data ?? EMPTY_EXPENSES;
+  const analysisHistoryQuery = useQuery({
+    queryKey: ["analysis-history", profileUserId],
+    enabled: authScreen === "app" && !!profileUserId,
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("spending_analyses")
+        .select("id,period,analysis,source,created_at")
+        .order("created_at", { ascending: false })
+        .limit(200);
+      if (error) throw error;
+      return data as AnalysisRecord[];
+    },
+  });
+  const analysisHistory = analysisHistoryQuery.data ?? EMPTY_ANALYSES;
+  const currentWeekStart = getWeekStart(now);
+  const currentWeekEnd = getWeekEnd(now);
+  const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const currentMonthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+  const currentWeekStartMs = currentWeekStart.getTime();
+  const currentWeekEndMs = currentWeekEnd.getTime();
+  const currentMonthStartMs = currentMonthStart.getTime();
+  const currentMonthEndMs = currentMonthEnd.getTime();
+  const hasWeeklyAnalysisForCurrentWeek = useMemo(
+    () =>
+      analysisHistory.some((entry) => {
+        if (entry.period !== "weekly") return false;
+        const createdAt = new Date(entry.created_at);
+        const createdAtMs = createdAt.getTime();
+        if (Number.isNaN(createdAtMs)) return false;
+        return isTimestampWithinRange(createdAtMs, currentWeekStartMs, currentWeekEndMs);
+      }),
+    [analysisHistory, currentWeekEndMs, currentWeekStartMs],
+  );
+  const hasMonthlyAnalysisForCurrentMonth = useMemo(
+    () =>
+      analysisHistory.some((entry) => {
+        if (entry.period !== "monthly") return false;
+        const createdAt = new Date(entry.created_at);
+        const createdAtMs = createdAt.getTime();
+        if (Number.isNaN(createdAtMs)) return false;
+        return isTimestampWithinRange(createdAtMs, currentMonthStartMs, currentMonthEndMs);
+      }),
+    [analysisHistory, currentMonthEndMs, currentMonthStartMs],
+  );
+  const filteredAnalysisHistory = useMemo(
+    () =>
+      analysisHistory.filter((item) => (analysisHistoryFilter === ANALYSIS_HISTORY_FILTER_ALL ? true : item.period === analysisHistoryFilter)),
+    [analysisHistory, analysisHistoryFilter],
+  );
+
+  useEffect(() => {
+    if (didHydrateAnalysisRef.current || analysisHistory.length === 0) return;
+    const latest = analysisHistory[0];
+    setAnalysisResult(latest.analysis);
+    setDisplayedAnalysis(latest.analysis);
+    setSelectedAnalysisId(latest.id);
+    setIsTypingAnalysis(false);
+    didHydrateAnalysisRef.current = true;
+  }, [analysisHistory]);
 
   const addExpenseMutation = useMutation({
     mutationFn: async (values: ExpenseFormValues) => {
@@ -414,6 +599,125 @@ export default function Home() {
     },
     onError: (error: Error) => setEditError(error.message),
   });
+  const analyzeSpendingMutation = useMutation({
+    mutationFn: async (period: "weekly" | "monthly") => {
+      if (expenses.length === 0) throw new Error("Add a few expenses first so analysis has data.");
+      if (period === "weekly" && !isSunday) throw new Error("Weekly analysis is available every Sunday only.");
+      if (period === "monthly" && !isMonthEnd) throw new Error("Monthly analysis is available only on the last day of the month.");
+      if (period === "weekly" && hasWeeklyAnalysisForCurrentWeek) throw new Error("Weekly analysis already generated for this week.");
+      if (period === "monthly" && hasMonthlyAnalysisForCurrentMonth) throw new Error("Monthly analysis already generated for this month.");
+
+      const currentPeriodRange =
+        period === "weekly"
+          ? { start: getWeekStart(now), end: getWeekEnd(now), label: "week" }
+          : { start: new Date(now.getFullYear(), now.getMonth(), 1), end: new Date(now.getFullYear(), now.getMonth() + 1, 0), label: "month" };
+      const previousPeriodRange =
+        period === "weekly"
+          ? {
+              start: new Date(currentPeriodRange.start.getFullYear(), currentPeriodRange.start.getMonth(), currentPeriodRange.start.getDate() - 7),
+              end: new Date(currentPeriodRange.end.getFullYear(), currentPeriodRange.end.getMonth(), currentPeriodRange.end.getDate() - 7),
+            }
+          : {
+              start: new Date(now.getFullYear(), now.getMonth() - 1, 1),
+              end: new Date(now.getFullYear(), now.getMonth(), 0),
+            };
+
+      const currentStartKey = toDateKey(currentPeriodRange.start);
+      const currentEndKey = toDateKey(currentPeriodRange.end);
+      const previousStartKey = toDateKey(previousPeriodRange.start);
+      const previousEndKey = toDateKey(previousPeriodRange.end);
+      const currentTotal = expenses
+        .filter((item) => item.expense_date >= currentStartKey && item.expense_date <= currentEndKey)
+        .reduce((sum, item) => sum + Number(item.amount), 0);
+      const previousTotal = expenses
+        .filter((item) => item.expense_date >= previousStartKey && item.expense_date <= previousEndKey)
+        .reduce((sum, item) => sum + Number(item.amount), 0);
+      const trend = currentTotal < previousTotal ? "better" : currentTotal > previousTotal ? "worse" : "no_change";
+      const previousSaved = analysisHistory.find((item) => item.period === period);
+
+      const response = await fetch("/api/analyze-spending", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          expenses,
+          cards,
+          currencyCode,
+          selectedMonthKey,
+          analysisType: period,
+          comparison: {
+            currentTotal,
+            previousTotal,
+            trend,
+            periodLabel: currentPeriodRange.label,
+          },
+          previousAnalysis: previousSaved?.analysis ?? null,
+        }),
+      });
+
+      const payload = (await response.json()) as SpendingAnalysisResponse & { error?: string };
+      if (!response.ok || !payload.analysis) {
+        throw new Error(payload.error || "Unable to analyze spending right now.");
+      }
+      return { analysis: payload.analysis, source: payload.source ?? "openrouter", period };
+    },
+    onSuccess: async ({ analysis, source, period }) => {
+      setAnalysisResult(analysis);
+      setAnalysisError("");
+      setAnalysisSaveError("");
+      startAnalysisTyping(analysis);
+      if (!profileUserId) return;
+      const duplicateExists = analysisHistory.some((entry) => {
+        if (entry.period !== period) return false;
+        const createdAt = new Date(entry.created_at);
+        const createdAtMs = createdAt.getTime();
+        if (Number.isNaN(createdAtMs)) return false;
+        if (period === "weekly") return isTimestampWithinRange(createdAtMs, currentWeekStartMs, currentWeekEndMs);
+        return isTimestampWithinRange(createdAtMs, currentMonthStartMs, currentMonthEndMs);
+      });
+      if (duplicateExists) {
+        setAnalysisSaveError(
+          period === "weekly"
+            ? "Weekly analysis already exists for this week. Please wait for next week."
+            : "Monthly analysis already exists for this month. Please wait for next month.",
+        );
+        return;
+      }
+      const { error } = await supabase.from("spending_analyses").insert({
+        user_id: profileUserId,
+        period,
+        analysis,
+        source,
+      });
+      if (error) {
+        setAnalysisSaveError("Analysis was generated but could not be saved. Check Supabase table setup.");
+        return;
+      }
+      queryClient.invalidateQueries({ queryKey: ["analysis-history", profileUserId] });
+    },
+    onError: (error: Error) => {
+      setAnalysisError(error.message);
+      setAnalysisResult("");
+      setDisplayedAnalysis("");
+      setIsTypingAnalysis(false);
+      setAnalysisSaveError("");
+    },
+    onSettled: () => {
+      setActiveAnalysisPeriod(null);
+    },
+  });
+  const selectSavedAnalysis = (entry: AnalysisRecord) => {
+    if (analysisTypingTimerRef.current) {
+      window.clearInterval(analysisTypingTimerRef.current);
+      analysisTypingTimerRef.current = null;
+    }
+    setIsTypingAnalysis(false);
+    setAnalysisError("");
+    setAnalysisSaveError("");
+    setSelectedAnalysisId(entry.id);
+    setAnalysisResult(entry.analysis);
+    setDisplayedAnalysis(entry.analysis);
+  };
+
 
   const totals = useMemo(() => {
     const cash = expenses.filter((item) => item.payment_type === "cash").reduce((sum, item) => sum + Number(item.amount), 0);
@@ -428,6 +732,21 @@ export default function Home() {
     const credit = currentMonthExpenses.filter((item) => item.payment_type === "credit").reduce((sum, item) => sum + Number(item.amount), 0);
     return { cash, credit, all: cash + credit };
   }, [expenses]);
+  const currentPeriodTotals = useMemo(() => {
+    const now = new Date();
+    const todayKey = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
+    const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
+    const startOfWeekKey = `${startOfWeek.getFullYear()}-${pad2(startOfWeek.getMonth() + 1)}-${pad2(startOfWeek.getDate())}`;
+
+    const dailyTotal = expenses
+      .filter((item) => item.expense_date === todayKey)
+      .reduce((sum, item) => sum + Number(item.amount), 0);
+    const weeklyTotal = expenses
+      .filter((item) => item.expense_date >= startOfWeekKey && item.expense_date <= todayKey)
+      .reduce((sum, item) => sum + Number(item.amount), 0);
+
+    return { daily: dailyTotal, weekly: weeklyTotal };
+  }, [expenses]);
 
   const monthlyBalances = useMemo(() => {
     return cards.map((card) => {
@@ -435,7 +754,7 @@ export default function Home() {
       expenses
         .filter((item) => item.payment_type === "credit" && item.card_id === card.id)
         .forEach((item) => {
-          const parsedDate = parseInputDate(formatDbDate(item.expense_date));
+          const parsedDate = parseDbDate(item.expense_date);
           if (!parsedDate) return;
           const baseMonthKey = getStatementMonthKey(parsedDate, card.cutoff_day);
           if (item.is_recurring) {
@@ -485,7 +804,7 @@ export default function Home() {
       return expenses
         .filter((item) => item.payment_type === "credit" && item.card_id === card.id && item.is_installment)
         .flatMap((item) => {
-          const parsedDate = parseInputDate(formatDbDate(item.expense_date));
+          const parsedDate = parseDbDate(item.expense_date);
           if (!parsedDate || !item.installment_tenure_months || !item.installment_monthly_amount) return [];
           const baseMonthKey = getStatementMonthKey(parsedDate, card.cutoff_day);
           const [startYear, startMonth] = baseMonthKey.split("-").map(Number);
@@ -516,7 +835,7 @@ export default function Home() {
       return expenses
         .filter((item) => item.payment_type === "credit" && item.card_id === card.id && item.is_recurring)
         .flatMap((item) => {
-          const parsedDate = parseInputDate(formatDbDate(item.expense_date));
+          const parsedDate = parseDbDate(item.expense_date);
           if (!parsedDate) return [];
           const baseMonthKey = getStatementMonthKey(parsedDate, card.cutoff_day);
           if (baseMonthKey > selectedMonthKey) return [];
@@ -539,7 +858,7 @@ export default function Home() {
     const included = expenses
       .filter((item) => item.payment_type === "cash")
       .flatMap((item) => {
-        const parsedDate = parseInputDate(formatDbDate(item.expense_date));
+        const parsedDate = parseDbDate(item.expense_date);
         if (!parsedDate) return [];
         const monthKey = `${parsedDate.getFullYear()}-${pad2(parsedDate.getMonth() + 1)}`;
         if (monthKey !== selectedMonthKey) return [];
@@ -595,10 +914,6 @@ export default function Home() {
     return filteredHistoryExpenses.slice(start, start + HISTORY_PAGE_SIZE);
   }, [filteredHistoryExpenses, currentHistoryPage]);
 
-  useEffect(() => {
-    setHistoryPage(1);
-  }, [historyCardFilter, historyMonthFilter]);
-
   const handleLogin = async () => {
     setAuthError("");
     setIsAuthLoading(true);
@@ -639,6 +954,7 @@ export default function Home() {
     { key: "history", icon: History, label: "History" },
     { key: "cards", icon: CreditCard, label: "Cards" },
     { key: "balances", icon: ChartLine, label: "Balances" },
+    { key: "analysis", icon: Sparkles, label: "Analysis" },
   ];
 
   const pageTitles: Record<TabKey, string> = {
@@ -646,6 +962,7 @@ export default function Home() {
     history: "Expense History",
     cards: "Credit Cards",
     balances: "Balances",
+    analysis: "Spending Analysis",
   };
 
   const paymentType = useWatch({ control: expenseForm.control, name: "paymentType" });
@@ -958,12 +1275,20 @@ export default function Home() {
               <div className="grid grid-cols-2 gap-2">
                 <Card className="bg-[#1d212c]"><CardContent className="p-3"><p className="text-xs text-[#a1a8b3]">Total Expenses</p><p>{formatCurrencySymbol(totals.all, currencyCode)}</p></CardContent></Card>
                 <Card className="bg-[#1d212c]"><CardContent className="p-3"><p className="text-xs text-[#a1a8b3]">Total This Month</p><p>{formatCurrencySymbol(currentMonthTotals.all, currencyCode)}</p></CardContent></Card>
+                <Card className="bg-[#122239]"><CardContent className="p-3"><p className="text-xs text-[#a1a8b3]">Total Today</p><p className="text-[#60a5fa]">{formatCurrencySymbol(currentPeriodTotals.daily, currencyCode)}</p></CardContent></Card>
+                <Card className="bg-[#1b2338]"><CardContent className="p-3"><p className="text-xs text-[#a1a8b3]">Total This Week</p><p className="text-[#93c5fd]">{formatCurrencySymbol(currentPeriodTotals.weekly, currencyCode)}</p></CardContent></Card>
                 <Card className="bg-[#11261b]"><CardContent className="p-3"><p className="text-xs text-[#a1a8b3]">Cash Expenses</p><p className="text-[#22c55e]">{formatCurrencySymbol(totals.cash, currencyCode)}</p></CardContent></Card>
                 <Card className="bg-[#24172f]"><CardContent className="p-3"><p className="text-xs text-[#a1a8b3]">Credit This Month</p><p className="text-[#a855f7]">{formatCurrencySymbol(currentMonthTotals.credit, currencyCode)}</p></CardContent></Card>
               </div>
 
               <div className="grid grid-cols-2 gap-2">
-                <Select value={historyCardFilter} onValueChange={setHistoryCardFilter}>
+                <Select
+                  value={historyCardFilter}
+                  onValueChange={(value) => {
+                    setHistoryCardFilter(value);
+                    setHistoryPage(1);
+                  }}
+                >
                   <SelectTrigger>
                     <SelectValue placeholder="All Cards" />
                   </SelectTrigger>
@@ -977,7 +1302,13 @@ export default function Home() {
                     ))}
                   </SelectContent>
                 </Select>
-                <Select value={historyMonthFilter} onValueChange={setHistoryMonthFilter}>
+                <Select
+                  value={historyMonthFilter}
+                  onValueChange={(value) => {
+                    setHistoryMonthFilter(value);
+                    setHistoryPage(1);
+                  }}
+                >
                   <SelectTrigger>
                     <SelectValue placeholder="All Months" />
                   </SelectTrigger>
@@ -1320,6 +1651,177 @@ export default function Home() {
                       </CardContent>
                     </Card>
                   ))}
+                </CardContent>
+              </Card>
+            </div>
+          )}
+
+          {tab === "analysis" && (
+            <div className="space-y-3">
+              <Card>
+                <CardContent className="space-y-4 p-4">
+                  <div>
+                    <p className="text-base font-semibold">AI insights</p>
+                    <p className="text-sm text-[#a1a8b3]">
+                      Generate personalized insights on where your money goes and practical ways to reduce spending.
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        setAnalysisError("");
+                        if (analysisTypingTimerRef.current) {
+                          window.clearInterval(analysisTypingTimerRef.current);
+                          analysisTypingTimerRef.current = null;
+                        }
+                        setIsTypingAnalysis(false);
+                        setSelectedAnalysisId("");
+                        setActiveAnalysisPeriod("weekly");
+                        analyzeSpendingMutation.mutate("weekly");
+                      }}
+                      disabled={analyzeSpendingMutation.isPending || !isSunday || hasWeeklyAnalysisForCurrentWeek}
+                    >
+                      {analyzeSpendingMutation.isPending && activeAnalysisPeriod === "weekly" ? (
+                        <span className="flex items-center gap-2">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Analyzing weekly...
+                        </span>
+                      ) : hasWeeklyAnalysisForCurrentWeek ? (
+                        "Weekly: already generated"
+                      ) : isSunday ? (
+                        "Analyze Weekly"
+                      ) : (
+                        "Weekly: Sunday only"
+                      )}
+                    </Button>
+                    <Select
+                      value={analysisHistoryFilter}
+                      onValueChange={(value: "__all__" | "weekly" | "monthly") => setAnalysisHistoryFilter(value)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={ANALYSIS_HISTORY_FILTER_ALL}>All Saved</SelectItem>
+                        <SelectItem value="weekly">Weekly</SelectItem>
+                        <SelectItem value="monthly">Monthly</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <Button
+                    className="w-full"
+                    onClick={() => {
+                      setAnalysisError("");
+                      if (analysisTypingTimerRef.current) {
+                        window.clearInterval(analysisTypingTimerRef.current);
+                        analysisTypingTimerRef.current = null;
+                      }
+                      setIsTypingAnalysis(false);
+                      setSelectedAnalysisId("");
+                      setActiveAnalysisPeriod("monthly");
+                      analyzeSpendingMutation.mutate("monthly");
+                    }}
+                    disabled={analyzeSpendingMutation.isPending || !isMonthEnd || hasMonthlyAnalysisForCurrentMonth}
+                  >
+                    {analyzeSpendingMutation.isPending && activeAnalysisPeriod === "monthly" ? (
+                      <span className="flex items-center gap-2">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Analyzing monthly...
+                      </span>
+                    ) : hasMonthlyAnalysisForCurrentMonth ? (
+                      "Monthly: already generated"
+                    ) : isMonthEnd ? (
+                      "Analyze Monthly"
+                    ) : (
+                      "Monthly: last day only"
+                    )}
+                  </Button>
+                  {analyzeSpendingMutation.isPending ? (
+                    <div className="rounded-lg border border-[#2a2f3a] bg-[#111827] p-3">
+                      <p className="text-sm text-[#93c5fd]">
+                        {activeAnalysisPeriod === "monthly" ? "Building monthly insights..." : "Building weekly insights..."}
+                      </p>
+                      <p className="mt-1 text-xs text-[#a1a8b3]">Crunching transactions, comparing with previous period, and generating recommendations.</p>
+                    </div>
+                  ) : null}
+                  {analysisError ? <p className="text-sm text-[#fb7185]">{analysisError}</p> : null}
+                  {!analysisError ? (
+                    <p className="text-xs text-[#a1a8b3]">
+                      Weekly analysis runs on Sunday (once per week). Monthly analysis runs on the last day of each month (once per month).
+                    </p>
+                  ) : null}
+                  {analysisSaveError ? <p className="text-sm text-[#f59e0b]">{analysisSaveError}</p> : null}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardContent className="space-y-3 p-4">
+                  <p className="text-xs text-[#a1a8b3]">SAVED INSIGHTS</p>
+                  {analysisHistoryQuery.isLoading ? (
+                    <p className="text-sm text-[#a1a8b3]">Loading saved insights...</p>
+                  ) : filteredAnalysisHistory.length === 0 ? (
+                    <p className="text-sm text-[#a1a8b3]">No saved insights yet.</p>
+                  ) : (
+                    filteredAnalysisHistory.slice(0, 8).map((entry) => (
+                      <button
+                        key={entry.id}
+                        className={`w-full rounded-xl border p-3 text-left ${
+                          selectedAnalysisId === entry.id ? "border-[#0a84ff] bg-[#0b2b51]" : "border-[#2a2f3a] bg-[#1d212c]"
+                        }`}
+                        onClick={() => selectSavedAnalysis(entry)}
+                      >
+                        <p className="text-sm font-semibold">{entry.period === "weekly" ? "Weekly insight" : "Monthly insight"}</p>
+                        <p className="text-xs text-[#a1a8b3]">
+                          {new Date(entry.created_at).toLocaleString()} {entry.source ? `• ${entry.source}` : ""}
+                        </p>
+                      </button>
+                    ))
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardContent className="space-y-3 p-4">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs text-[#a1a8b3]">RESULT</p>
+                    {isTypingAnalysis ? <Badge className="bg-[#0b2b51] text-[#93c5fd]">Typing...</Badge> : null}
+                  </div>
+                  {analyzeSpendingMutation.isPending || (analysisHistoryQuery.isLoading && !analysisResult) ? (
+                    <AnalysisResultSkeleton />
+                  ) : analysisResult ? (
+                    <div className="space-y-3">
+                      {parsedAnalysisSections.length > 0 ? (
+                        parsedAnalysisSections.map((section, index) => (
+                          <div key={`${section.title}-${index}`} className="rounded-xl border border-[#2a2f3a] bg-[#1d212c] p-3">
+                            {section.title ? <p className="mb-2 text-sm font-semibold text-[#e5e7eb]">{section.title}</p> : null}
+                            {section.paragraphs.map((paragraph, paragraphIndex) => (
+                              <p key={`${section.title}-p-${paragraphIndex}`} className="text-sm leading-6 text-[#cbd5e1]">
+                                {paragraph}
+                              </p>
+                            ))}
+                            {section.bullets.length > 0 ? (
+                              <ul className="mt-2 space-y-1 text-sm text-[#cbd5e1]">
+                                {section.bullets.map((bullet, bulletIndex) => (
+                                  <li key={`${section.title}-b-${bulletIndex}`} className="flex gap-2">
+                                    <span className="mt-[2px] text-[#60a5fa]">•</span>
+                                    <span>{bullet}</span>
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : null}
+                          </div>
+                        ))
+                      ) : (
+                        <div className="whitespace-pre-wrap text-sm leading-6 text-[#e5e7eb]">{displayedAnalysis}</div>
+                      )}
+                      {isTypingAnalysis ? (
+                        <p className="text-xs text-[#93c5fd]">Generating insights...</p>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <p className="text-sm text-[#a1a8b3]">No analysis yet. Tap the button above to generate insights.</p>
+                  )}
                 </CardContent>
               </Card>
             </div>
