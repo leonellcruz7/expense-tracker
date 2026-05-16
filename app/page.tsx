@@ -3,8 +3,10 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  AlertCircle,
   CalendarDays,
   ChartLine,
+  CheckCircle2,
   ChevronLeft,
   CreditCard,
   History,
@@ -37,6 +39,7 @@ type CreditCardType = {
   id: string;
   name: string;
   cutoff_day: number;
+  payment_deadline_day: number;
 };
 
 type ExpenseType = {
@@ -52,6 +55,14 @@ type ExpenseType = {
   installment_monthly_amount: number | null;
   installment_months_paid: number;
   is_recurring: boolean;
+};
+
+type CardPaymentType = {
+  id: string;
+  card_id: string;
+  statement_month_key: string;
+  amount_paid: number;
+  paid_at: string;
 };
 
 type SpendingAnalysisResponse = {
@@ -98,6 +109,7 @@ const expenseSchema = z
 const cardSchema = z.object({
   name: z.string().min(1),
   cutoff_day: z.coerce.number().int().min(1).max(31),
+  payment_deadline_day: z.coerce.number().int().min(1).max(31),
 });
 type ExpenseFormValues = z.input<typeof expenseSchema>;
 type CardFormValues = z.input<typeof cardSchema>;
@@ -120,6 +132,7 @@ const MONTH_NAMES = [
 const EMPTY_CARDS: CreditCardType[] = [];
 const EMPTY_EXPENSES: ExpenseType[] = [];
 const EMPTY_ANALYSES: AnalysisRecord[] = [];
+const EMPTY_PAYMENTS: CardPaymentType[] = [];
 
 const pad2 = (value: number) => String(value).padStart(2, "0");
 const formatInputDate = (date: Date) => `${pad2(date.getDate())}/${pad2(date.getMonth() + 1)}/${date.getFullYear()}`;
@@ -251,6 +264,7 @@ export default function Home() {
   const [editingCardId, setEditingCardId] = useState<string | null>(null);
   const [editCardName, setEditCardName] = useState("");
   const [editCardCutoffDay, setEditCardCutoffDay] = useState("1");
+  const [editCardPaymentDeadlineDay, setEditCardPaymentDeadlineDay] = useState("15");
   const [editError, setEditError] = useState("");
   const [isAddDatePickerOpen, setIsAddDatePickerOpen] = useState(false);
   const [isEditDatePickerOpen, setIsEditDatePickerOpen] = useState(false);
@@ -358,7 +372,7 @@ export default function Home() {
 
   const cardForm = useForm<CardFormValues>({
     resolver: zodResolver(cardSchema),
-    defaultValues: { name: "", cutoff_day: 1 },
+    defaultValues: { name: "", cutoff_day: 1, payment_deadline_day: 15 },
   });
 
   const monthChoices = useMemo(() => monthOptions(), []);
@@ -393,9 +407,22 @@ export default function Home() {
     queryKey: ["cards", profileUserId],
     enabled: authScreen === "app" && !!profileUserId,
     queryFn: async () => {
-      const { data, error } = await supabase.from("credit_cards").select("id,name,cutoff_day").order("created_at", { ascending: true });
+      const { data, error } = await supabase.from("credit_cards").select("id,name,cutoff_day,payment_deadline_day").order("created_at", { ascending: true });
       if (error) throw error;
       return data as CreditCardType[];
+    },
+  });
+
+  const paymentsQuery = useQuery({
+    queryKey: ["card-payments", profileUserId],
+    enabled: authScreen === "app" && !!profileUserId,
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("credit_card_payments")
+        .select("id,card_id,statement_month_key,amount_paid,paid_at")
+        .order("paid_at", { ascending: false });
+      if (error) throw error;
+      return data as CardPaymentType[];
     },
   });
 
@@ -416,6 +443,17 @@ export default function Home() {
 
   const cards = cardsQuery.data ?? EMPTY_CARDS;
   const expenses = expensesQuery.data ?? EMPTY_EXPENSES;
+  const payments = paymentsQuery.data ?? EMPTY_PAYMENTS;
+  const paidStatementKeys = useMemo(() => {
+    const set = new Set<string>();
+    payments.forEach((payment) => set.add(`${payment.card_id}:${payment.statement_month_key}`));
+    return set;
+  }, [payments]);
+  const cardNameById = useMemo(() => {
+    const map = new Map<string, string>();
+    cards.forEach((card) => map.set(card.id, card.name));
+    return map;
+  }, [cards]);
   const analysisHistoryQuery = useQuery({
     queryKey: ["analysis-history", profileUserId],
     enabled: authScreen === "app" && !!profileUserId,
@@ -524,12 +562,17 @@ export default function Home() {
   const addCardMutation = useMutation({
     mutationFn: async (values: CardFormValues) => {
       const parsed = cardSchema.parse(values);
-      const { error } = await supabase.from("credit_cards").insert({ user_id: profileUserId, name: parsed.name, cutoff_day: parsed.cutoff_day });
+      const { error } = await supabase.from("credit_cards").insert({
+        user_id: profileUserId,
+        name: parsed.name,
+        cutoff_day: parsed.cutoff_day,
+        payment_deadline_day: parsed.payment_deadline_day,
+      });
       if (error) throw error;
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["cards", profileUserId] });
-      cardForm.reset({ name: "", cutoff_day: 1 });
+      cardForm.reset({ name: "", cutoff_day: 1, payment_deadline_day: 15 });
     },
     onError: (error: Error) => setFormError(error.message),
   });
@@ -586,10 +629,42 @@ export default function Home() {
       queryClient.invalidateQueries({ queryKey: ["expenses", profileUserId] });
     },
   });
+  const markAsPaidMutation = useMutation({
+    mutationFn: async (values: { cardId: string; statementMonthKey: string; amount: number }) => {
+      const { error } = await supabase.from("credit_card_payments").insert({
+        user_id: profileUserId,
+        card_id: values.cardId,
+        statement_month_key: values.statementMonthKey,
+        amount_paid: Number(values.amount.toFixed(2)),
+      });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["card-payments", profileUserId] });
+    },
+  });
+
+  const deletePaymentMutation = useMutation({
+    mutationFn: async (paymentId: string) => {
+      const { error } = await supabase.from("credit_card_payments").delete().eq("id", paymentId);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["card-payments", profileUserId] });
+    },
+  });
+
   const updateCardMutation = useMutation({
-    mutationFn: async (values: { id: string; name: string; cutoffDay: number }) => {
-      const parsed = cardSchema.parse({ name: values.name, cutoff_day: values.cutoffDay });
-      const { error } = await supabase.from("credit_cards").update({ name: parsed.name, cutoff_day: parsed.cutoff_day }).eq("id", values.id);
+    mutationFn: async (values: { id: string; name: string; cutoffDay: number; paymentDeadlineDay: number }) => {
+      const parsed = cardSchema.parse({
+        name: values.name,
+        cutoff_day: values.cutoffDay,
+        payment_deadline_day: values.paymentDeadlineDay,
+      });
+      const { error } = await supabase
+        .from("credit_cards")
+        .update({ name: parsed.name, cutoff_day: parsed.cutoff_day, payment_deadline_day: parsed.payment_deadline_day })
+        .eq("id", values.id);
       if (error) throw error;
     },
     onSuccess: () => {
@@ -799,6 +874,69 @@ export default function Home() {
     () => monthlyBalances.reduce((sum, { total }) => sum + total, 0),
     [monthlyBalances],
   );
+  const dueForPaymentCards = useMemo(() => {
+    const today = new Date();
+    const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+    const getDeadlineDate = (deadlineDay: number, baseYear: number, baseMonth: number) => {
+      const lastDay = new Date(baseYear, baseMonth + 1, 0).getDate();
+      return new Date(baseYear, baseMonth, Math.min(deadlineDay, lastDay));
+    };
+
+    return cards
+      .map((card) => {
+        let deadline = getDeadlineDate(card.payment_deadline_day, today.getFullYear(), today.getMonth());
+        if (deadline.getTime() < todayMidnight.getTime()) {
+          deadline = getDeadlineDate(card.payment_deadline_day, today.getFullYear(), today.getMonth() + 1);
+        }
+        const daysUntilDue = Math.round((deadline.getTime() - todayMidnight.getTime()) / MS_PER_DAY);
+        if (daysUntilDue > 5) return null;
+
+        // The statement being paid is the one whose cutoff happened most recently before the deadline.
+        let statementYear = deadline.getFullYear();
+        let statementMonth = deadline.getMonth();
+        if (card.cutoff_day > card.payment_deadline_day) {
+          const previousMonth = new Date(statementYear, statementMonth - 1, 1);
+          statementYear = previousMonth.getFullYear();
+          statementMonth = previousMonth.getMonth();
+        }
+        const statementMonthKey = `${statementYear}-${pad2(statementMonth + 1)}`;
+        if (paidStatementKeys.has(`${card.id}:${statementMonthKey}`)) return null;
+
+        let balance = 0;
+        expenses
+          .filter((item) => item.payment_type === "credit" && item.card_id === card.id)
+          .forEach((item) => {
+            const parsedDate = parseDbDate(item.expense_date);
+            if (!parsedDate) return;
+            const baseMonthKey = getStatementMonthKey(parsedDate, card.cutoff_day);
+            if (item.is_recurring) {
+              if (baseMonthKey <= statementMonthKey) balance += Number(item.amount);
+              return;
+            }
+            if (!item.is_installment || !item.installment_tenure_months || !item.installment_monthly_amount) {
+              if (baseMonthKey === statementMonthKey) balance += Number(item.amount);
+              return;
+            }
+            const [startYear, startMonth] = baseMonthKey.split("-").map(Number);
+            for (let idx = item.installment_months_paid; idx < item.installment_tenure_months; idx += 1) {
+              const cycleDate = new Date(startYear, startMonth - 1 + idx, 1);
+              const cycleKey = `${cycleDate.getFullYear()}-${pad2(cycleDate.getMonth() + 1)}`;
+              if (cycleKey === statementMonthKey) balance += Number(item.installment_monthly_amount);
+            }
+          });
+
+        return { card, deadline, daysUntilDue, balance, statementMonthKey };
+      })
+      .filter(
+        (
+          item,
+        ): item is { card: CreditCardType; deadline: Date; daysUntilDue: number; balance: number; statementMonthKey: string } =>
+          item !== null,
+      )
+      .sort((a, b) => a.daysUntilDue - b.daysUntilDue);
+  }, [cards, expenses, paidStatementKeys]);
   const installmentBalanceItems = useMemo(() => {
     return cards.flatMap((card) => {
       return expenses
@@ -976,6 +1114,7 @@ export default function Home() {
   const paidInput = useWatch({ control: expenseForm.control, name: "monthsPaid" });
   const cardNameInput = useWatch({ control: cardForm.control, name: "name" });
   const cardCutoffInput = useWatch({ control: cardForm.control, name: "cutoff_day" });
+  const cardPaymentDeadlineInput = useWatch({ control: cardForm.control, name: "payment_deadline_day" });
   const amount = Number(amountInput || 0);
   const selectedExpenseDate = parseInputDate(dateInput);
   const tenure = Number(tenureInput || 0);
@@ -1005,6 +1144,7 @@ export default function Home() {
     setEditingCardId(card.id);
     setEditCardName(card.name);
     setEditCardCutoffDay(String(card.cutoff_day));
+    setEditCardPaymentDeadlineDay(String(card.payment_deadline_day));
     setEditError("");
   };
   const cancelEditingCard = () => {
@@ -1022,8 +1162,18 @@ export default function Home() {
       setEditError("Cutoff day must be between 1 and 31.");
       return;
     }
+    const parsedDeadlineDay = Number(editCardPaymentDeadlineDay || 0);
+    if (!Number.isInteger(parsedDeadlineDay) || parsedDeadlineDay < 1 || parsedDeadlineDay > 31) {
+      setEditError("Payment deadline day must be between 1 and 31.");
+      return;
+    }
     setEditError("");
-    updateCardMutation.mutate({ id: card.id, name: trimmedName, cutoffDay: parsedCutoffDay });
+    updateCardMutation.mutate({
+      id: card.id,
+      name: trimmedName,
+      cutoffDay: parsedCutoffDay,
+      paymentDeadlineDay: parsedDeadlineDay,
+    });
   };
 
   const saveEditingExpense = (item: ExpenseType) => {
@@ -1468,6 +1618,72 @@ export default function Home() {
 
           {tab === "cards" && (
             <div className="space-y-3">
+              {dueForPaymentCards.length > 0 ? (
+                <>
+                  <p className="px-1 text-xs text-[#a1a8b3]">DUE FOR PAYMENT</p>
+                  <Card className="border-[#5a2a2a] bg-[#2a1414]">
+                    <CardContent className="p-2">
+                      {dueForPaymentCards.map(({ card, deadline, daysUntilDue, balance, statementMonthKey }, index) => {
+                        const dueLabel =
+                          daysUntilDue === 0
+                            ? "Due today"
+                            : daysUntilDue === 1
+                              ? "Due tomorrow"
+                              : `Due in ${daysUntilDue} days`;
+                        const deadlineLabel = `${MONTH_NAMES[deadline.getMonth()]} ${deadline.getDate()}`;
+                        const [statementYearStr, statementMonthStr] = statementMonthKey.split("-");
+                        const statementLabel = `${MONTH_NAMES[Number(statementMonthStr) - 1]} ${statementYearStr} statement`;
+                        const isPending =
+                          markAsPaidMutation.isPending && markAsPaidMutation.variables?.cardId === card.id;
+                        return (
+                          <div key={card.id}>
+                            <div className="flex flex-col gap-3 p-3 sm:flex-row sm:items-center">
+                              <div className="flex flex-1 items-start gap-3">
+                                <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-[#fbbf24]" />
+                                <div className="flex-1">
+                                  <p className="font-medium">{card.name}</p>
+                                  <p className="text-sm text-[#fbbf24]">
+                                    {dueLabel} • {deadlineLabel}
+                                  </p>
+                                  <p className="text-xs text-[#a1a8b3]">{statementLabel}</p>
+                                </div>
+                              </div>
+                              <div className="flex items-center justify-between gap-3 sm:flex-col sm:items-end">
+                                <p className="font-semibold text-[#fb7185]">{formatCurrencySymbol(balance, currencyCode)}</p>
+                                <Button
+                                  size="sm"
+                                  className="bg-[#22c55e] hover:bg-[#16a34a]"
+                                  disabled={isPending || balance <= 0}
+                                  onClick={() =>
+                                    markAsPaidMutation.mutate({
+                                      cardId: card.id,
+                                      statementMonthKey,
+                                      amount: balance,
+                                    })
+                                  }
+                                >
+                                  {isPending ? (
+                                    <span className="flex items-center gap-1">
+                                      <Loader2 className="h-3 w-3 animate-spin" />
+                                      Saving
+                                    </span>
+                                  ) : (
+                                    <span className="flex items-center gap-1">
+                                      <CheckCircle2 className="h-3 w-3" />
+                                      Mark as Paid
+                                    </span>
+                                  )}
+                                </Button>
+                              </div>
+                            </div>
+                            {index !== dueForPaymentCards.length - 1 ? <Separator /> : null}
+                          </div>
+                        );
+                      })}
+                    </CardContent>
+                  </Card>
+                </>
+              ) : null}
               <p className="px-1 text-xs text-[#a1a8b3]">GENERAL</p>
               <Card>
                 <CardContent className="space-y-3 p-3">
@@ -1478,6 +1694,16 @@ export default function Home() {
                   <div className="space-y-1">
                     <p className="text-xs text-[#a1a8b3]">Cutoff Day</p>
                     <Input className={SPINNERLESS_NUMBER_INPUT_CLASS} type="number" placeholder="1-31" value={String(cardCutoffInput ?? 1)} onChange={(e) => cardForm.setValue("cutoff_day", Number(e.target.value))} />
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-xs text-[#a1a8b3]">Payment Deadline Day</p>
+                    <Input
+                      className={SPINNERLESS_NUMBER_INPUT_CLASS}
+                      type="number"
+                      placeholder="1-31"
+                      value={String(cardPaymentDeadlineInput ?? 15)}
+                      onChange={(e) => cardForm.setValue("payment_deadline_day", Number(e.target.value))}
+                    />
                   </div>
                 </CardContent>
               </Card>
@@ -1507,6 +1733,15 @@ export default function Home() {
                                   onChange={(e) => setEditCardCutoffDay(e.target.value)}
                                 />
                               </div>
+                              <div className="space-y-1">
+                                <p className="text-xs text-[#a1a8b3]">Payment Deadline Day</p>
+                                <Input
+                                  className={SPINNERLESS_NUMBER_INPUT_CLASS}
+                                  type="number"
+                                  value={editCardPaymentDeadlineDay}
+                                  onChange={(e) => setEditCardPaymentDeadlineDay(e.target.value)}
+                                />
+                              </div>
                               <div className="flex gap-2">
                                 <Button size="sm" onClick={() => saveEditingCard(card)} disabled={updateCardMutation.isPending}>Save</Button>
                                 <Button size="sm" variant="outline" onClick={cancelEditingCard}>Cancel</Button>
@@ -1516,7 +1751,7 @@ export default function Home() {
                             <>
                               <div>
                                 <p>{card.name}</p>
-                                <p className="text-sm text-[#a1a8b3]">Cutoff day {card.cutoff_day}</p>
+                                <p className="text-sm text-[#a1a8b3]">Cutoff day {card.cutoff_day} • Due day {card.payment_deadline_day}</p>
                               </div>
                               <div className="flex gap-2">
                                 <Button variant="outline" size="icon" onClick={() => startEditingCard(card)}>
@@ -1531,6 +1766,55 @@ export default function Home() {
                         {index !== cards.length - 1 ? <Separator /> : null}
                       </div>
                     ))
+                  )}
+                </CardContent>
+              </Card>
+
+              <p className="px-1 text-xs text-[#a1a8b3]">PAYMENT HISTORY</p>
+              <Card>
+                <CardContent className="p-2">
+                  {payments.length === 0 ? (
+                    <div className="p-6 text-center text-[#a1a8b3]">No payments recorded yet</div>
+                  ) : (
+                    payments.map((payment, index) => {
+                      const [yearStr, monthStr] = payment.statement_month_key.split("-");
+                      const statementLabel = `${MONTH_NAMES[Number(monthStr) - 1]} ${yearStr}`;
+                      const paidDate = new Date(payment.paid_at);
+                      const paidLabel = Number.isNaN(paidDate.getTime())
+                        ? payment.paid_at
+                        : `${MONTH_NAMES[paidDate.getMonth()]} ${paidDate.getDate()}, ${paidDate.getFullYear()}`;
+                      const cardName = cardNameById.get(payment.card_id) ?? "Deleted card";
+                      const isDeleting =
+                        deletePaymentMutation.isPending && deletePaymentMutation.variables === payment.id;
+                      return (
+                        <div key={payment.id}>
+                          <div className="flex items-center justify-between gap-3 p-3">
+                            <div className="flex flex-1 items-start gap-3">
+                              <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-[#22c55e]" />
+                              <div className="flex-1">
+                                <p className="font-medium">{cardName}</p>
+                                <p className="text-sm text-[#a1a8b3]">{statementLabel} statement</p>
+                                <p className="text-xs text-[#a1a8b3]">Paid on {paidLabel}</p>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <p className="font-semibold text-[#22c55e]">
+                                {formatCurrencySymbol(Number(payment.amount_paid), currencyCode)}
+                              </p>
+                              <Button
+                                variant="destructive"
+                                size="icon"
+                                disabled={isDeleting}
+                                onClick={() => deletePaymentMutation.mutate(payment.id)}
+                              >
+                                {isDeleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                              </Button>
+                            </div>
+                          </div>
+                          {index !== payments.length - 1 ? <Separator /> : null}
+                        </div>
+                      );
+                    })
                   )}
                 </CardContent>
               </Card>
