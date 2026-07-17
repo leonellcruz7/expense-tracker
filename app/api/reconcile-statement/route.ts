@@ -229,7 +229,7 @@ const extractLineItemsFromImage = async (params: {
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
+      model: "anthropic/claude-sonnet-5",
       response_format: { type: "json_object" },
       messages: [
         {
