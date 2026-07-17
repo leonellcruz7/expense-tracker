@@ -31,6 +31,11 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import {
+  defaultReconcileSelection,
+  RECONCILE_AMOUNT_TOLERANCE,
+  totalsMatch,
+} from "@/lib/reconcile-totals";
 import { hasSupabaseEnv, supabase } from "@/lib/supabase";
 import { TabKey, useBudgetStore } from "@/store/use-budget-store";
 
@@ -85,6 +90,14 @@ type ReconcileState = {
   imageCount: number;
   error: string;
   applying: boolean;
+  expectedTotal: number;
+};
+
+type ReconcilePromptState = {
+  accountName: string;
+  paymentType: PaymentType;
+  cardId: string | null;
+  expectedTotalDisplay: string;
 };
 
 type SpendingAnalysisResponse = {
@@ -302,7 +315,9 @@ export default function Home() {
   const [isModalDatePickerOpen, setIsModalDatePickerOpen] = useState(false);
   const monthSwipeStartX = useRef<number | null>(null);
   const [reconcile, setReconcile] = useState<ReconcileState | null>(null);
+  const [reconcilePrompt, setReconcilePrompt] = useState<ReconcilePromptState | null>(null);
   const reconcileFileInputRef = useRef<HTMLInputElement | null>(null);
+  const reconcileExpectedTotalRef = useRef<number | null>(null);
   const reconcileContextRef = useRef<{ accountName: string; paymentType: PaymentType; cardId: string | null } | null>(null);
   const [analysisResult, setAnalysisResult] = useState("");
   const [analysisError, setAnalysisError] = useState("");
@@ -1391,6 +1406,21 @@ export default function Home() {
 
   const startReconcile = (paymentType: PaymentType, cardId: string | null, accountName: string) => {
     reconcileContextRef.current = { paymentType, cardId, accountName };
+    reconcileExpectedTotalRef.current = null;
+    setReconcilePrompt({
+      accountName,
+      paymentType,
+      cardId,
+      expectedTotalDisplay: "",
+    });
+  };
+
+  const continueReconcileWithExpectedTotal = () => {
+    if (!reconcilePrompt) return;
+    const amount = parseAmountDisplay(reconcilePrompt.expectedTotalDisplay);
+    if (!(amount > 0)) return;
+    reconcileExpectedTotalRef.current = amount;
+    setReconcilePrompt(null);
     reconcileFileInputRef.current?.click();
   };
 
@@ -1400,6 +1430,24 @@ export default function Home() {
     if (files.length === 0) return;
     const ctx = reconcileContextRef.current;
     if (!ctx) return;
+
+    const expectedTotal = reconcileExpectedTotalRef.current;
+    if (!(typeof expectedTotal === "number" && expectedTotal > 0)) {
+      setReconcile({
+        status: "error",
+        accountName: ctx.accountName,
+        paymentType: ctx.paymentType,
+        cardId: ctx.cardId,
+        changes: [],
+        selected: {},
+        lineItemCount: 0,
+        imageCount: files.length,
+        error: "A positive expected total is required.",
+        applying: false,
+        expectedTotal: 0,
+      });
+      return;
+    }
 
     if (files.length > 5) {
       setReconcile({
@@ -1413,6 +1461,7 @@ export default function Home() {
         imageCount: files.length,
         error: "You can upload at most 5 statement images.",
         applying: false,
+        expectedTotal,
       });
       return;
     }
@@ -1436,6 +1485,7 @@ export default function Home() {
       imageCount: files.length,
       error: "",
       applying: false,
+      expectedTotal,
     });
 
     try {
@@ -1450,22 +1500,19 @@ export default function Home() {
           accountName: ctx.accountName,
           currencyCode,
           selectedMonthKey,
+          expectedTotal,
         }),
       });
       const json = (await response.json()) as {
         changes?: ReconcileChange[];
         lineItemCount?: number;
         imageCount?: number;
+        expectedTotal?: number;
         error?: string;
       };
       if (!response.ok) throw new Error(json.error || "Failed to reconcile statement.");
       const changes = Array.isArray(json.changes) ? json.changes : [];
-      const selected: Record<string, boolean> = {};
-      for (const change of changes) {
-        if (change.kind === "add" || change.kind === "update" || change.kind === "kept" || change.kind === "locked") {
-          selected[change.id] = true;
-        }
-      }
+      const selected = defaultReconcileSelection(changes);
       setReconcile((prev) =>
         prev
           ? {
@@ -1475,6 +1522,7 @@ export default function Home() {
               selected,
               lineItemCount: typeof json.lineItemCount === "number" ? json.lineItemCount : 0,
               imageCount: typeof json.imageCount === "number" ? json.imageCount : files.length,
+              expectedTotal: typeof json.expectedTotal === "number" ? json.expectedTotal : expectedTotal,
             }
           : prev,
       );
@@ -2447,6 +2495,53 @@ export default function Home() {
         onChange={onReconcileFileChange}
       />
 
+      {reconcilePrompt && (
+        <div className="fixed inset-0 z-50 bg-[#05070d]/95 px-5 py-4">
+          <div className="mx-auto max-w-md space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold">Reconcile — {reconcilePrompt.accountName}</h2>
+              <Button variant="outline" onClick={() => setReconcilePrompt(null)}>
+                Cancel
+              </Button>
+            </div>
+            <Card>
+              <CardContent className="space-y-3 p-4">
+                <div className="space-y-1">
+                  <label htmlFor="reconcile-expected-total" className="text-xs text-[#a1a8b3]">
+                    Expected total after reconcile ({getCurrencySymbol(currencyCode)})
+                  </label>
+                  <Input
+                    id="reconcile-expected-total"
+                    type="text"
+                    inputMode="decimal"
+                    value={reconcilePrompt.expectedTotalDisplay}
+                    onChange={(e) =>
+                      setReconcilePrompt((prev) =>
+                        prev ? { ...prev, expectedTotalDisplay: formatAmountDisplay(e.target.value) } : prev,
+                      )
+                    }
+                    placeholder="0.00"
+                  />
+                </div>
+                <p className="text-xs text-[#a1a8b3]">Include installment and recurring charges for this month.</p>
+                <div className="flex gap-2">
+                  <Button
+                    className="flex-1"
+                    onClick={continueReconcileWithExpectedTotal}
+                    disabled={parseAmountDisplay(reconcilePrompt.expectedTotalDisplay) <= 0}
+                  >
+                    Continue
+                  </Button>
+                  <Button variant="outline" onClick={() => setReconcilePrompt(null)}>
+                    Cancel
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      )}
+
       {reconcile && (() => {
         const updates = reconcile.changes.filter((change) => change.kind === "update");
         const adds = reconcile.changes.filter((change) => change.kind === "add");
@@ -2533,6 +2628,35 @@ export default function Home() {
                     ) : null}
                     . Payments/credits are ignored.
                   </p>
+
+                  {(() => {
+                    const expected = reconcile.expectedTotal;
+                    const liveTotal = newTotal;
+                    const delta = liveTotal - expected;
+                    const matches = totalsMatch(liveTotal, expected);
+                    return (
+                      <Card>
+                        <CardContent className={`p-4 text-sm ${matches ? "text-[#34d399]" : "text-[#fbbf24]"}`}>
+                          {matches ? (
+                            <p>Total matches expected: {formatCurrencySymbol(expected, currencyCode)}</p>
+                          ) : (
+                            <p>
+                              Expected {formatCurrencySymbol(expected, currencyCode)}
+                              {" · "}
+                              reconciled total {formatCurrencySymbol(liveTotal, currencyCode)}
+                              {" · "}
+                              off by {formatCurrencySymbol(Math.abs(delta), currencyCode)}
+                              {delta > RECONCILE_AMOUNT_TOLERANCE
+                                ? " (over)"
+                                : delta < -RECONCILE_AMOUNT_TOLERANCE
+                                  ? " (under)"
+                                  : ""}
+                            </p>
+                          )}
+                        </CardContent>
+                      </Card>
+                    );
+                  })()}
 
                   {actionable.length === 0 ? (
                     <Card>
