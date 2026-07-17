@@ -41,6 +41,25 @@ const MAX_MATCH_AMOUNT_RATIO = 0.15;
 
 const normalizeText = (value: string) => value.trim().toLowerCase().replace(/\s+/g, " ");
 
+/** Parse model output that may be raw JSON, fenced ```json, or wrapped in prose. */
+const parseModelJson = <T>(content: string): T => {
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  let candidate = (fenced?.[1] ?? trimmed).trim();
+
+  try {
+    return JSON.parse(candidate) as T;
+  } catch {
+    const start = candidate.indexOf("{");
+    const end = candidate.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      candidate = candidate.slice(start, end + 1);
+      return JSON.parse(candidate) as T;
+    }
+    throw new Error("Model response was not valid JSON.");
+  }
+};
+
 const amountsMatch = (a: number, b: number) => Math.abs(Number(a) - Number(b)) <= AMOUNT_TOLERANCE;
 
 const amountsCloseEnoughToMatch = (a: number, b: number) => {
@@ -207,7 +226,7 @@ const extractLineItemsFromImage = async (params: {
     "If no good amount match, set matchedExpenseId to null.",
     "Each tracked expense id may be matched at most once on this page.",
     "",
-    "Return ONLY JSON of this exact shape:",
+    "Return ONLY a raw JSON object (no markdown fences, no commentary) of this exact shape:",
     '{ "extractedCount": number, "lineItems": [ { "description": string, "amount": number, "date": string|null, "matchedExpenseId": string|null } ] }',
     "extractedCount MUST equal lineItems.length.",
     "",
@@ -234,7 +253,8 @@ const extractLineItemsFromImage = async (params: {
       messages: [
         {
           role: "system",
-          content: "You extract structured data from financial statement images. Return strict JSON.",
+          content:
+            "You extract structured data from financial statement images. Reply with a single raw JSON object only — no markdown code fences, no preamble.",
         },
         {
           role: "user",
@@ -244,8 +264,7 @@ const extractLineItemsFromImage = async (params: {
           ],
         },
       ],
-      temperature: 0,
-      max_tokens: 1000,
+      max_tokens: 8192,
     }),
     cache: "no-store",
   });
@@ -255,19 +274,26 @@ const extractLineItemsFromImage = async (params: {
     const isQuotaError =
       response.status === 429 ||
       errorText.toLowerCase().includes("quota exceeded") ||
-      errorText.toLowerCase().includes("rate limit");
+      errorText.toLowerCase().includes("rate limit") ||
+      errorText.toLowerCase().includes("more credits");
     throw new Error(isQuotaError ? "AI quota/rate limit reached. Please try again later." : `Reconcile request failed: ${errorText}`);
   }
 
-  const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
-  const content = data.choices?.[0]?.message?.content?.trim() ?? "";
+  const data = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+  };
+  const choice = data.choices?.[0];
+  const content = choice?.message?.content?.trim() ?? "";
   if (!content) throw new Error(`Empty AI response for ${pageLabel}.`);
+  if (choice?.finish_reason === "length") {
+    throw new Error(`AI response for ${pageLabel} was truncated. Try uploading fewer charges per image or a cropped page.`);
+  }
 
   let parsed: { lineItems?: StatementLineItem[] };
   try {
-    parsed = JSON.parse(content) as { lineItems?: StatementLineItem[] };
+    parsed = parseModelJson<{ lineItems?: StatementLineItem[] }>(content);
   } catch {
-    throw new Error(`Could not read ${pageLabel}. Please try a clearer image.`);
+    throw new Error(`Could not parse AI response for ${pageLabel}. Please try again.`);
   }
 
   return Array.isArray(parsed.lineItems) ? parsed.lineItems : [];
