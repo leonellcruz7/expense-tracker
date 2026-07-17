@@ -1,3 +1,9 @@
+import {
+  computeProjectedTotal,
+  defaultReconcileSelection,
+  parseExpectedTotal,
+  totalsMatch,
+} from "@/lib/reconcile-totals";
 import { NextResponse } from "next/server";
 
 type ExpenseInput = {
@@ -18,6 +24,7 @@ type ReconcileRequestBody = {
   accountName?: string;
   currencyCode?: "USD" | "PHP";
   selectedMonthKey?: string;
+  expectedTotal?: number;
 };
 
 type StatementLineItem = {
@@ -205,9 +212,10 @@ const extractLineItemsFromImage = async (params: {
   currencyCode: "USD" | "PHP";
   accountName: string;
   selectedMonthKey?: string;
+  expectedTotal: number;
   pageLabel: string;
 }): Promise<StatementLineItem[]> => {
-  const { apiKey, image, expenses, currencyCode, accountName, selectedMonthKey, pageLabel } = params;
+  const { apiKey, image, expenses, currencyCode, accountName, selectedMonthKey, expectedTotal, pageLabel } = params;
 
   const prompt = [
     "You are extracting charges from ONE page of a financial statement image.",
@@ -229,6 +237,10 @@ const extractLineItemsFromImage = async (params: {
     "Return ONLY a raw JSON object (no markdown fences, no commentary) of this exact shape:",
     '{ "extractedCount": number, "lineItems": [ { "description": string, "amount": number, "date": string|null, "matchedExpenseId": string|null } ] }',
     "extractedCount MUST equal lineItems.length.",
+    "",
+    `TARGET TOTAL: After reconcile, the user's tracked expenses for this account/month should sum to ${expectedTotal} (including installment/recurring charges that stay locked).`,
+    "Extract charges so that the resulting tracked total is as close as possible to that target.",
+    "Prefer correct billed amounts from the image. Do NOT invent charges that are not visible just to hit the total.",
     "",
     "Tracked expenses (JSON):",
     JSON.stringify(
@@ -299,6 +311,127 @@ const extractLineItemsFromImage = async (params: {
   return Array.isArray(parsed.lineItems) ? parsed.lineItems : [];
 };
 
+const reviseLineItemsForExpectedTotal = async (params: {
+  apiKey: string;
+  images: string[];
+  expenses: ExpenseInput[];
+  previousLineItems: StatementLineItem[];
+  expectedTotal: number;
+  projectedTotal: number;
+  currencyCode: "USD" | "PHP";
+  accountName: string;
+  selectedMonthKey?: string;
+}): Promise<StatementLineItem[]> => {
+  const {
+    apiKey,
+    images,
+    expenses,
+    previousLineItems,
+    expectedTotal,
+    projectedTotal,
+    currencyCode,
+    accountName,
+    selectedMonthKey,
+  } = params;
+
+  const delta = expectedTotal - projectedTotal;
+
+  const prompt = [
+    "You are revising extracted statement charges so the reconciled tracked total matches the user's expected total.",
+    `Currency: ${currencyCode}. Account: ${accountName}. Statement month: ${selectedMonthKey ?? "unknown"}.`,
+    "",
+    `Expected total after reconcile: ${expectedTotal}`,
+    `Pass-1 projected total: ${projectedTotal}`,
+    `Delta to close (expected - projected): ${delta}`,
+    "",
+    "Previous extracted line items (JSON):",
+    JSON.stringify(previousLineItems),
+    "",
+    "Revise these line items so that after re-diffing against tracked expenses, the projected total equals the expected total.",
+    "Only use charges visible on the statement images. Fix incorrect amounts, add missing visible charges, and drop false positives.",
+    "Do NOT invent charges that are not visible on the images.",
+    "Keep the same line item shape and matching rules as extraction (billed currency amounts, matchedExpenseId when amounts match tracked expenses).",
+    "",
+    "Return ONLY a raw JSON object (no markdown fences, no commentary) of this exact shape:",
+    '{ "lineItems": [ { "description": string, "amount": number, "date": string|null, "matchedExpenseId": string|null } ] }',
+    "",
+    "Tracked expenses (JSON):",
+    JSON.stringify(
+      expenses.map((expense) => ({
+        id: expense.id,
+        description: expense.description,
+        amount: expense.amount,
+        date: expense.expense_date,
+      })),
+    ),
+  ].join("\n");
+
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: "anthropic/claude-sonnet-5",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You revise structured statement charge data from financial statement images. Reply with a single raw JSON object only — no markdown code fences, no preamble.",
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            ...images.map((url) => ({ type: "image_url", image_url: { url, detail: "high" } })),
+          ],
+        },
+      ],
+      max_tokens: 8192,
+    }),
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    const isQuotaError =
+      response.status === 429 ||
+      errorText.toLowerCase().includes("quota exceeded") ||
+      errorText.toLowerCase().includes("rate limit") ||
+      errorText.toLowerCase().includes("more credits");
+    throw new Error(isQuotaError ? "AI quota/rate limit reached. Please try again later." : `Reconcile request failed: ${errorText}`);
+  }
+
+  const data = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+  };
+  const choice = data.choices?.[0];
+  const content = choice?.message?.content?.trim() ?? "";
+  if (!content) throw new Error("Empty AI response for revision pass.");
+  if (choice?.finish_reason === "length") {
+    throw new Error("AI revision response was truncated. Try uploading fewer charges per image or a cropped page.");
+  }
+
+  let parsed: { lineItems?: StatementLineItem[] };
+  try {
+    parsed = parseModelJson<{ lineItems?: StatementLineItem[] }>(content);
+  } catch {
+    throw new Error("Could not parse AI revision response. Please try again.");
+  }
+
+  const lineItems = parsed.lineItems;
+  if (!Array.isArray(lineItems)) {
+    throw new Error("Could not parse AI revision response. Please try again.");
+  }
+  if (lineItems.length === 0 && previousLineItems.length > 0) {
+    throw new Error("AI revision returned no line items. Please try again.");
+  }
+
+  return lineItems;
+};
+
 const dedupeLineItems = (items: StatementLineItem[]): StatementLineItem[] => {
   const seen = new Set<string>();
   const result: StatementLineItem[] = [];
@@ -333,6 +466,14 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Invalid request payload." }, { status: 400 });
   }
 
+  let expectedTotal: number;
+  try {
+    expectedTotal = parseExpectedTotal(body.expectedTotal);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "A positive expected total is required.";
+    return NextResponse.json({ error: message }, { status: 400 });
+  }
+
   const images = [
     ...(Array.isArray(body.images) ? body.images : []),
     ...(typeof body.image === "string" ? [body.image] : []),
@@ -359,6 +500,7 @@ export async function POST(request: Request) {
           currencyCode,
           accountName,
           selectedMonthKey: body.selectedMonthKey,
+          expectedTotal,
           pageLabel: images.length === 1 ? "the statement image" : `page ${index + 1} of ${images.length}`,
         }),
       ),
@@ -366,12 +508,52 @@ export async function POST(request: Request) {
 
     const lineItems = dedupeLineItems(pageResults.flat());
     const changes = buildDiff(lineItems, expenses);
+    const selected = defaultReconcileSelection(changes);
+    const projectedTotal = computeProjectedTotal(changes, selected);
+    const totalMatches = totalsMatch(projectedTotal, expectedTotal);
+
+    let lineItemsFinal = lineItems;
+    let changesFinal = changes;
+    let projectedFinal = projectedTotal;
+    let matchesFinal = totalMatches;
+    let usedSecondPass = false;
+
+    if (!matchesFinal) {
+      try {
+        const revised = await reviseLineItemsForExpectedTotal({
+          apiKey,
+          images,
+          expenses,
+          previousLineItems: lineItems,
+          expectedTotal,
+          projectedTotal: projectedFinal,
+          currencyCode,
+          accountName,
+          selectedMonthKey: body.selectedMonthKey,
+        });
+        const revisedDeduped = dedupeLineItems(revised);
+        const revisedChanges = buildDiff(revisedDeduped, expenses);
+        const revisedSelected = defaultReconcileSelection(revisedChanges);
+        const revisedProjected = computeProjectedTotal(revisedChanges, revisedSelected);
+        lineItemsFinal = revisedDeduped;
+        changesFinal = revisedChanges;
+        projectedFinal = revisedProjected;
+        matchesFinal = totalsMatch(revisedProjected, expectedTotal);
+        usedSecondPass = true;
+      } catch {
+        // keep pass-1 results; usedSecondPass stays false
+      }
+    }
 
     return NextResponse.json({
-      changes,
-      lineItemCount: lineItems.length,
+      changes: changesFinal,
+      lineItemCount: lineItemsFinal.length,
       imageCount: images.length,
       source: "openrouter",
+      expectedTotal,
+      projectedTotal: projectedFinal,
+      totalMatches: matchesFinal,
+      usedSecondPass,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
