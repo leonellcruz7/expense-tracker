@@ -8,6 +8,7 @@ import {
   ChartLine,
   CheckCircle2,
   ChevronLeft,
+  ChevronRight,
   CreditCard,
   History,
   Loader2,
@@ -17,7 +18,7 @@ import {
   Sparkles,
   Trash2,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { z } from "zod";
 
@@ -63,6 +64,27 @@ type CardPaymentType = {
   statement_month_key: string;
   amount_paid: number;
   paid_at: string;
+};
+
+type ReconcileChange = {
+  id: string;
+  kind: "update" | "add" | "kept" | "unchanged" | "locked";
+  expenseId: string | null;
+  statement: { description: string; amount: number; date: string | null } | null;
+  tracked: { description: string; amount: number; expense_date: string } | null;
+};
+
+type ReconcileState = {
+  status: "loading" | "ready" | "error";
+  accountName: string;
+  paymentType: PaymentType;
+  cardId: string | null;
+  changes: ReconcileChange[];
+  selected: Record<string, boolean>;
+  lineItemCount: number;
+  imageCount: number;
+  error: string;
+  applying: boolean;
 };
 
 type SpendingAnalysisResponse = {
@@ -253,7 +275,6 @@ export default function Home() {
   const [signupConfirmPassword, setSignupConfirmPassword] = useState("");
   const [isAuthLoading, setIsAuthLoading] = useState(false);
   const [amountDisplay, setAmountDisplay] = useState("0");
-  const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null);
   const [editDescription, setEditDescription] = useState("");
   const [editDate, setEditDate] = useState("");
   const [editAmountDisplay, setEditAmountDisplay] = useState("0");
@@ -267,12 +288,22 @@ export default function Home() {
   const [editCardPaymentDeadlineDay, setEditCardPaymentDeadlineDay] = useState("15");
   const [editError, setEditError] = useState("");
   const [isAddDatePickerOpen, setIsAddDatePickerOpen] = useState(false);
-  const [isEditDatePickerOpen, setIsEditDatePickerOpen] = useState(false);
   const [historyPage, setHistoryPage] = useState(1);
   const [historyCardFilter, setHistoryCardFilter] = useState(HISTORY_CARD_FILTER_ALL);
   const [historyMonthFilter, setHistoryMonthFilter] = useState(HISTORY_MONTH_FILTER_ALL);
   const [balanceDetailType, setBalanceDetailType] = useState<"installments" | "recurring" | null>(null);
   const [expandedBalanceItems, setExpandedBalanceItems] = useState<Record<string, boolean>>({});
+  const [expenseModal, setExpenseModal] = useState<
+    | { mode: "add"; paymentType: PaymentType; cardId: string | null }
+    | { mode: "edit"; expense: ExpenseType }
+    | null
+  >(null);
+  const [modalIsInstallment, setModalIsInstallment] = useState(false);
+  const [isModalDatePickerOpen, setIsModalDatePickerOpen] = useState(false);
+  const monthSwipeStartX = useRef<number | null>(null);
+  const [reconcile, setReconcile] = useState<ReconcileState | null>(null);
+  const reconcileFileInputRef = useRef<HTMLInputElement | null>(null);
+  const reconcileContextRef = useRef<{ accountName: string; paymentType: PaymentType; cardId: string | null } | null>(null);
   const [analysisResult, setAnalysisResult] = useState("");
   const [analysisError, setAnalysisError] = useState("");
   const [displayedAnalysis, setDisplayedAnalysis] = useState("");
@@ -555,6 +586,7 @@ export default function Home() {
       });
       setAmountDisplay("0");
       setFormError("");
+      setExpenseModal(null);
     },
     onError: (error: Error) => setFormError(error.message),
   });
@@ -613,8 +645,8 @@ export default function Home() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["expenses", profileUserId] });
-      setEditingExpenseId(null);
       setEditError("");
+      setExpenseModal(null);
     },
     onError: (error: Error) => setEditError(error.message),
   });
@@ -825,7 +857,7 @@ export default function Home() {
 
   const monthlyBalances = useMemo(() => {
     return cards.map((card) => {
-      const included: { id: string; label: string; amount: number }[] = [];
+      const included: { id: string; label: string; amount: number; expense: ExpenseType }[] = [];
       expenses
         .filter((item) => item.payment_type === "credit" && item.card_id === card.id)
         .forEach((item) => {
@@ -838,6 +870,7 @@ export default function Home() {
                 id: `${item.id}-${selectedMonthKey}`,
                 label: `${formatHistoryDate(item.expense_date)} - ${item.description} (Recurring)`,
                 amount: Number(item.amount),
+                expense: item,
               });
             }
             return;
@@ -848,6 +881,7 @@ export default function Home() {
                 id: item.id,
                 label: `${formatHistoryDate(item.expense_date)} - ${item.description}`,
                 amount: Number(item.amount),
+                expense: item,
               });
             }
             return;
@@ -862,6 +896,7 @@ export default function Home() {
                 id: `${item.id}-${idx}`,
                 label: `${formatHistoryDate(item.expense_date)} - ${item.description} ${idx + 1}/${item.installment_tenure_months}`,
                 amount: Number(item.installment_monthly_amount),
+                expense: item,
               });
             }
           }
@@ -1005,6 +1040,7 @@ export default function Home() {
             id: item.id,
             label: `${formatHistoryDate(item.expense_date)} - ${item.description}`,
             amount: Number(item.amount),
+            expense: item,
           },
         ];
       });
@@ -1122,10 +1158,8 @@ export default function Home() {
   const computedMonthlyPayment = tenure > 0 ? amount / tenure : 0;
   const computedRemainingBalance = Math.max(amount - paid * computedMonthlyPayment, 0);
   const computedRemainingMonths = Math.max(tenure - paid, 0);
-  const editingDate = parseInputDate(editDate);
 
   const startEditingExpense = (item: ExpenseType) => {
-    setEditingExpenseId(item.id);
     setEditDescription(item.description);
     setEditDate(formatDbDate(item.expense_date));
     setEditAmountDisplay(formatAmountDisplay(String(item.amount)));
@@ -1136,10 +1170,6 @@ export default function Home() {
     setEditError("");
   };
 
-  const cancelEditingExpense = () => {
-    setEditingExpenseId(null);
-    setEditError("");
-  };
   const startEditingCard = (card: CreditCardType) => {
     setEditingCardId(card.id);
     setEditCardName(card.name);
@@ -1227,6 +1257,289 @@ export default function Home() {
       monthsPaid: item.is_installment ? parsedMonthsPaid : 0,
       isRecurring: item.payment_type === "credit" ? editIsRecurring : false,
     });
+  };
+
+  const openAddExpenseModal = (paymentType: PaymentType, cardId: string | null) => {
+    setEditDescription("");
+    setEditAmountDisplay("0");
+    setEditDate(formatInputDate(new Date()));
+    setEditCardId(cardId ?? "");
+    setEditTenureMonths("12");
+    setEditMonthsPaid("0");
+    setEditIsRecurring(false);
+    setModalIsInstallment(false);
+    setEditError("");
+    setExpenseModal({ mode: "add", paymentType, cardId });
+  };
+
+  const openEditExpenseModal = (expense: ExpenseType) => {
+    startEditingExpense(expense);
+    setModalIsInstallment(expense.is_installment);
+    setExpenseModal({ mode: "edit", expense });
+  };
+
+  const closeExpenseModal = () => {
+    setExpenseModal(null);
+    setEditError("");
+  };
+
+  const saveExpenseModal = () => {
+    if (!expenseModal) return;
+    if (expenseModal.mode === "edit") {
+      saveEditingExpense(expenseModal.expense);
+      return;
+    }
+
+    const trimmedDescription = editDescription.trim();
+    if (!trimmedDescription) {
+      setEditError("Description is required.");
+      return;
+    }
+    const parsedAmount = parseAmountDisplay(editAmountDisplay);
+    if (parsedAmount <= 0) {
+      setEditError("Amount must be greater than 0.");
+      return;
+    }
+    if (!toDbDate(editDate)) {
+      setEditError("Date must be valid.");
+      return;
+    }
+    const isCredit = expenseModal.paymentType === "credit";
+    if (isCredit && !expenseModal.cardId) {
+      setEditError("Select a credit card.");
+      return;
+    }
+    const parsedTenure = Number(editTenureMonths || 0);
+    const parsedMonthsPaid = Number(editMonthsPaid || 0);
+    if (isCredit && modalIsInstallment) {
+      if (!Number.isInteger(parsedTenure) || parsedTenure < 1) {
+        setEditError("Tenure must be at least 1.");
+        return;
+      }
+      if (!Number.isInteger(parsedMonthsPaid) || parsedMonthsPaid < 0) {
+        setEditError("Months paid must be 0 or more.");
+        return;
+      }
+      if (parsedMonthsPaid > parsedTenure) {
+        setEditError("Months paid cannot exceed tenure.");
+        return;
+      }
+    }
+    setEditError("");
+    addExpenseMutation.mutate({
+      amount: parsedAmount,
+      description: trimmedDescription,
+      date: editDate,
+      paymentType: expenseModal.paymentType,
+      cardId: expenseModal.cardId ?? "",
+      isInstallment: isCredit && modalIsInstallment,
+      isRecurring: isCredit && !modalIsInstallment && editIsRecurring,
+      tenureMonths: isCredit && modalIsInstallment ? parsedTenure : undefined,
+      monthsPaid: isCredit && modalIsInstallment ? parsedMonthsPaid : undefined,
+    });
+  };
+
+  const shiftSelectedMonth = (delta: number) => {
+    const idx = monthChoices.findIndex((choice) => choice.key === selectedMonthKey);
+    if (idx === -1) return;
+    const next = idx + delta;
+    if (next < 0 || next >= monthChoices.length) return;
+    setSelectedMonthKey(monthChoices[next].key);
+  };
+
+  const handleMonthSwipeEnd = (endX: number) => {
+    if (monthSwipeStartX.current === null) return;
+    const dx = endX - monthSwipeStartX.current;
+    monthSwipeStartX.current = null;
+    const SWIPE_THRESHOLD = 40;
+    if (dx <= -SWIPE_THRESHOLD) shiftSelectedMonth(1);
+    else if (dx >= SWIPE_THRESHOLD) shiftSelectedMonth(-1);
+  };
+
+  const getReconcileScope = (paymentType: PaymentType, cardId: string | null) => {
+    const rows =
+      paymentType === "cash"
+        ? cashBalance.included
+        : monthlyBalances.find((entry) => entry.card.id === cardId)?.included ?? [];
+    const seen = new Set<string>();
+    const scoped: {
+      id: string;
+      description: string;
+      amount: number;
+      expense_date: string;
+      payment_type: PaymentType;
+      card_id: string | null;
+      is_installment: boolean;
+      is_recurring: boolean;
+    }[] = [];
+    for (const line of rows) {
+      if (seen.has(line.expense.id)) continue;
+      seen.add(line.expense.id);
+      scoped.push({
+        id: line.expense.id,
+        description: line.expense.description,
+        amount: line.amount,
+        expense_date: line.expense.expense_date,
+        payment_type: line.expense.payment_type,
+        card_id: line.expense.card_id,
+        is_installment: line.expense.is_installment,
+        is_recurring: line.expense.is_recurring,
+      });
+    }
+    return scoped;
+  };
+
+  const startReconcile = (paymentType: PaymentType, cardId: string | null, accountName: string) => {
+    reconcileContextRef.current = { paymentType, cardId, accountName };
+    reconcileFileInputRef.current?.click();
+  };
+
+  const onReconcileFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (files.length === 0) return;
+    const ctx = reconcileContextRef.current;
+    if (!ctx) return;
+
+    if (files.length > 5) {
+      setReconcile({
+        status: "error",
+        accountName: ctx.accountName,
+        paymentType: ctx.paymentType,
+        cardId: ctx.cardId,
+        changes: [],
+        selected: {},
+        lineItemCount: 0,
+        imageCount: files.length,
+        error: "You can upload at most 5 statement images.",
+        applying: false,
+      });
+      return;
+    }
+
+    const readFileAsDataUrl = (input: File) =>
+      new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(new Error("Could not read the image file."));
+        reader.readAsDataURL(input);
+      });
+
+    setReconcile({
+      status: "loading",
+      accountName: ctx.accountName,
+      paymentType: ctx.paymentType,
+      cardId: ctx.cardId,
+      changes: [],
+      selected: {},
+      lineItemCount: 0,
+      imageCount: files.length,
+      error: "",
+      applying: false,
+    });
+
+    try {
+      const images = await Promise.all(files.map((file) => readFileAsDataUrl(file)));
+      const scoped = getReconcileScope(ctx.paymentType, ctx.cardId);
+      const response = await fetch("/api/reconcile-statement", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          images,
+          expenses: scoped,
+          accountName: ctx.accountName,
+          currencyCode,
+          selectedMonthKey,
+        }),
+      });
+      const json = (await response.json()) as {
+        changes?: ReconcileChange[];
+        lineItemCount?: number;
+        imageCount?: number;
+        error?: string;
+      };
+      if (!response.ok) throw new Error(json.error || "Failed to reconcile statement.");
+      const changes = Array.isArray(json.changes) ? json.changes : [];
+      const selected: Record<string, boolean> = {};
+      for (const change of changes) {
+        if (change.kind === "add" || change.kind === "update" || change.kind === "kept" || change.kind === "locked") {
+          selected[change.id] = true;
+        }
+      }
+      setReconcile((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: "ready",
+              changes,
+              selected,
+              lineItemCount: typeof json.lineItemCount === "number" ? json.lineItemCount : 0,
+              imageCount: typeof json.imageCount === "number" ? json.imageCount : files.length,
+            }
+          : prev,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to reconcile statement.";
+      setReconcile((prev) => (prev ? { ...prev, status: "error", error: message } : prev));
+    }
+  };
+
+  const applyReconcile = async () => {
+    if (!reconcile) return;
+    setReconcile((prev) => (prev ? { ...prev, applying: true, error: "" } : prev));
+    try {
+      const selectedChanges = reconcile.changes.filter(
+        (change) => reconcile.selected[change.id] && (change.kind === "add" || change.kind === "update"),
+      );
+      const toRemove = reconcile.changes.filter(
+        (change) =>
+          !reconcile.selected[change.id] &&
+          (change.kind === "kept" || change.kind === "locked") &&
+          change.expenseId,
+      );
+
+      for (const change of selectedChanges) {
+        if (change.kind === "add" && change.statement) {
+          const dbDate = change.statement.date ?? `${selectedMonthKey}-01`;
+          const { error } = await supabase.from("expenses").insert({
+            user_id: profileUserId,
+            description: change.statement.description.trim() || "Statement charge",
+            amount: Number(change.statement.amount.toFixed(2)),
+            currency_code: currencyCode,
+            expense_date: dbDate,
+            payment_type: reconcile.paymentType,
+            card_id: reconcile.paymentType === "credit" ? reconcile.cardId : null,
+            is_installment: false,
+            is_recurring: false,
+            installment_tenure_months: null,
+            installment_monthly_amount: null,
+            installment_months_paid: 0,
+          });
+          if (error) throw error;
+        } else if (change.kind === "update" && change.expenseId && change.statement) {
+          const { error } = await supabase
+            .from("expenses")
+            .update({
+              description: change.statement.description.trim() || change.tracked?.description || "",
+              amount: Number(change.statement.amount.toFixed(2)),
+              expense_date: change.statement.date ?? change.tracked?.expense_date,
+            })
+            .eq("id", change.expenseId);
+          if (error) throw error;
+        }
+      }
+
+      for (const change of toRemove) {
+        const { error } = await supabase.from("expenses").delete().eq("id", change.expenseId!);
+        if (error) throw error;
+      }
+
+      queryClient.invalidateQueries({ queryKey: ["expenses", profileUserId] });
+      setReconcile(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to apply changes.";
+      setReconcile((prev) => (prev ? { ...prev, applying: false, error: message } : prev));
+    }
   };
 
   if (!hasSupabaseEnv) {
@@ -1477,119 +1790,24 @@ export default function Home() {
                 <CardContent className="space-y-3 p-4">
                   {paginatedExpenses.map((item) => {
                     const cardName = cards.find((card) => card.id === item.card_id)?.name;
-                    const isEditing = editingExpenseId === item.id;
                     return (
                       <div key={item.id} className="rounded-xl border border-[#2a2f3a] bg-[#1d212c] p-4">
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex-1">
-                            {isEditing ? (
-                              <div className="space-y-2">
-                                <div className="space-y-1">
-                                  <p className="text-xs text-[#a1a8b3]">Description</p>
-                                  <Input value={editDescription} onChange={(e) => setEditDescription(e.target.value)} placeholder="Description" />
-                                </div>
-                                <div className="space-y-1">
-                                  <p className="text-xs text-[#a1a8b3]">Date</p>
-                                <Popover open={isEditDatePickerOpen} onOpenChange={setIsEditDatePickerOpen}>
-                                  <PopoverTrigger asChild>
-                                    <Button variant="outline" className="w-full justify-start gap-2 text-left font-normal text-[#a1a8b3]">
-                                      <CalendarDays className="h-4 w-4 text-[#7d8596]" />
-                                      {editingDate ? formatInputDate(editingDate) : "Pick a date"}
-                                    </Button>
-                                  </PopoverTrigger>
-                                  <PopoverContent align="start" className="w-auto p-0">
-                                    <Calendar
-                                      mode="single"
-                                      selected={editingDate ?? undefined}
-                                      onSelect={(date) => {
-                                        if (!date) return;
-                                        setEditDate(formatInputDate(date));
-                                        setIsEditDatePickerOpen(false);
-                                      }}
-                                    />
-                                  </PopoverContent>
-                                </Popover>
-                                </div>
-                                <div className="space-y-1">
-                                  <p className="text-xs text-[#a1a8b3]">Amount</p>
-                                  <Input
-                                    type="text"
-                                    inputMode="decimal"
-                                    value={editAmountDisplay}
-                                    onChange={(e) => setEditAmountDisplay(formatAmountDisplay(e.target.value))}
-                                    placeholder="Amount"
-                                  />
-                                </div>
-                                {item.payment_type === "credit" ? (
-                                  <div className="space-y-1">
-                                    <p className="text-xs text-[#a1a8b3]">Card</p>
-                                    <Select value={editCardId || undefined} onValueChange={setEditCardId}>
-                                      <SelectTrigger>
-                                        <SelectValue placeholder="Select Card" />
-                                      </SelectTrigger>
-                                      <SelectContent>
-                                        {cards.map((card) => (
-                                          <SelectItem key={card.id} value={card.id}>{card.name}</SelectItem>
-                                        ))}
-                                      </SelectContent>
-                                    </Select>
-                                  </div>
-                                ) : null}
-                                {item.payment_type === "credit" ? (
-                                  <div className="flex items-center gap-2">
-                                    <Switch checked={editIsRecurring} onCheckedChange={setEditIsRecurring} />
-                                    <span className="text-sm text-[#a1a8b3]">Recurring (monthly)</span>
-                                  </div>
-                                ) : null}
-                                {item.is_installment && !editIsRecurring ? (
-                                  <div className="grid grid-cols-2 gap-2">
-                                    <div className="space-y-1">
-                                      <p className="text-xs text-[#a1a8b3]">Tenure (months)</p>
-                                      <Input
-                                        className={SPINNERLESS_NUMBER_INPUT_CLASS}
-                                        type="number"
-                                        value={editTenureMonths}
-                                        onChange={(e) => setEditTenureMonths(e.target.value)}
-                                      />
-                                    </div>
-                                    <div className="space-y-1">
-                                      <p className="text-xs text-[#a1a8b3]">Months Paid</p>
-                                      <Input
-                                        className={SPINNERLESS_NUMBER_INPUT_CLASS}
-                                        type="number"
-                                        value={editMonthsPaid}
-                                        onChange={(e) => setEditMonthsPaid(e.target.value)}
-                                      />
-                                    </div>
-                                  </div>
-                                ) : null}
-                              </div>
-                            ) : (
-                              <p className="font-semibold">{item.description}</p>
-                            )}
+                            <p className="font-semibold">{item.description}</p>
                             <p className="text-sm text-[#a1a8b3]">{item.payment_type === "cash" ? "Cash" : cardName ?? "Credit Card"}</p>
                             {item.is_installment && item.installment_tenure_months ? <Badge>{Math.max(item.installment_tenure_months - item.installment_months_paid, 0)} left</Badge> : null}
                             {item.is_recurring ? <Badge>Recurring</Badge> : null}
                           </div>
                           <div className="text-right">
-                            {isEditing ? (
-                              <div className="space-y-2">
-                                <Button size="sm" onClick={() => saveEditingExpense(item)} disabled={updateExpenseMutation.isPending}>Save</Button>
-                                <Button size="sm" variant="outline" onClick={cancelEditingExpense}>Cancel</Button>
-                              </div>
-                            ) : (
-                              <>
-                                <p className="font-semibold text-[#fb7185]">-{formatCurrencySymbol(Number(item.amount), currencyCode)}</p>
-                                <p className="text-sm text-[#a1a8b3]">{formatHistoryDate(item.expense_date)}</p>
-                                <div className="mt-1 flex justify-end gap-2">
-                                  <button onClick={() => startEditingExpense(item)} className="text-[#a1a8b3]"><Pencil className="h-4 w-4" /></button>
-                                  <button onClick={() => deleteExpenseMutation.mutate(item.id)} className="text-[#fb7185]"><Trash2 className="h-4 w-4" /></button>
-                                </div>
-                              </>
-                            )}
+                            <p className="font-semibold text-[#fb7185]">-{formatCurrencySymbol(Number(item.amount), currencyCode)}</p>
+                            <p className="text-sm text-[#a1a8b3]">{formatHistoryDate(item.expense_date)}</p>
+                            <div className="mt-1 flex justify-end gap-2">
+                              <button onClick={() => openEditExpenseModal(item)} className="text-[#a1a8b3]"><Pencil className="h-4 w-4" /></button>
+                              <button onClick={() => deleteExpenseMutation.mutate(item.id)} className="text-[#fb7185]"><Trash2 className="h-4 w-4" /></button>
+                            </div>
                           </div>
                         </div>
-                        {isEditing && editError ? <p className="mt-2 text-sm text-[#fb7185]">{editError}</p> : null}
                       </div>
                     );
                   })}
@@ -1826,16 +2044,35 @@ export default function Home() {
               <Card>
                 <CardContent className="space-y-3 p-4">
                   <p className="px-1 text-xs text-[#a1a8b3]">MONTH FILTER</p>
-                  <Select value={selectedMonthKey} onValueChange={setSelectedMonthKey}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                    {monthChoices.map((choice) => (
-                      <SelectItem key={choice.key} value={choice.key}>{choice.label}</SelectItem>
-                    ))}
-                    </SelectContent>
-                  </Select>
+                  <div
+                    className="flex touch-pan-y select-none items-center justify-between gap-2 rounded-xl border border-[#2a2f3a] bg-[#1d212c] px-2 py-2"
+                    onTouchStart={(e) => {
+                      monthSwipeStartX.current = e.touches[0].clientX;
+                    }}
+                    onTouchEnd={(e) => handleMonthSwipeEnd(e.changedTouches[0].clientX)}
+                  >
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      aria-label="Previous month"
+                      onClick={() => shiftSelectedMonth(-1)}
+                      disabled={monthChoices[0]?.key === selectedMonthKey}
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <span className="text-sm font-medium">
+                      {monthChoices.find((choice) => choice.key === selectedMonthKey)?.label ?? ""}
+                    </span>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      aria-label="Next month"
+                      onClick={() => shiftSelectedMonth(1)}
+                      disabled={monthChoices[monthChoices.length - 1]?.key === selectedMonthKey}
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </div>
                 </CardContent>
               </Card>
 
@@ -1865,7 +2102,12 @@ export default function Home() {
                   <p className="px-1 text-xs text-[#a1a8b3]">GENERAL</p>
 
                   <Card className="rounded-xl bg-[#1d212c]">
-                    <CardHeader><CardTitle>Cash</CardTitle></CardHeader>
+                    <CardHeader className="flex flex-row items-center justify-between gap-2">
+                      <CardTitle>Cash</CardTitle>
+                      <Button variant="outline" size="sm" onClick={() => openAddExpenseModal("cash", null)}>
+                        <PlusCircle className="mr-1 h-4 w-4" /> Add
+                      </Button>
+                    </CardHeader>
                     <CardContent className="space-y-2">
                       <p className="text-sm text-[#a1a8b3]">{cashBalance.included.length} transaction{cashBalance.included.length === 1 ? "" : "s"}</p>
                       <p className="text-xl font-semibold text-[#22c55e]">{formatCurrencySymbol(cashBalance.total, currencyCode)}</p>
@@ -1884,13 +2126,25 @@ export default function Home() {
                       {expandedBalanceItems.cash ? (
                         <>
                           <Separator />
+                          <Button variant="outline" size="sm" className="w-full" onClick={() => startReconcile("cash", null, "Cash")}>
+                            <Sparkles className="mr-1 h-4 w-4" /> Reconcile with statement
+                          </Button>
+                          <p className="text-xs text-[#a1a8b3]">Tip: select all statement page images at once.</p>
                           {cashBalance.included.length === 0 ? (
                             <p className="text-sm text-[#a1a8b3]">No cash transactions in this month.</p>
                           ) : (
                             cashBalance.included.map((line) => (
-                              <div key={line.id} className="flex justify-between text-sm">
-                                <span>{line.label}</span>
+                              <div key={line.id} className="flex items-center justify-between gap-2 text-sm">
+                                <span className="flex-1">{line.label}</span>
                                 <span>{formatCurrencySymbol(line.amount, currencyCode)}</span>
+                                <div className="flex gap-2">
+                                  <button onClick={() => openEditExpenseModal(line.expense)} className="text-[#a1a8b3]">
+                                    <Pencil className="h-4 w-4" />
+                                  </button>
+                                  <button onClick={() => deleteExpenseMutation.mutate(line.expense.id)} className="text-[#fb7185]">
+                                    <Trash2 className="h-4 w-4" />
+                                  </button>
+                                </div>
                               </div>
                             ))
                           )}
@@ -1901,7 +2155,12 @@ export default function Home() {
 
                   {monthlyBalances.map(({ card, included, total }) => (
                     <Card key={card.id} className="rounded-xl bg-[#1d212c]">
-                      <CardHeader><CardTitle>{card.name}</CardTitle></CardHeader>
+                      <CardHeader className="flex flex-row items-center justify-between gap-2">
+                        <CardTitle>{card.name}</CardTitle>
+                        <Button variant="outline" size="sm" onClick={() => openAddExpenseModal("credit", card.id)}>
+                          <PlusCircle className="mr-1 h-4 w-4" /> Add
+                        </Button>
+                      </CardHeader>
                       <CardContent className="space-y-2">
                         <p className="text-sm text-[#a1a8b3]">Cutoff day: {card.cutoff_day} • {included.length} transaction{included.length === 1 ? "" : "s"}</p>
                         <p className="text-xl font-semibold text-[#fb7185]">{formatCurrencySymbol(total, currencyCode)}</p>
@@ -1920,13 +2179,25 @@ export default function Home() {
                         {expandedBalanceItems[card.id] ? (
                           <>
                             <Separator />
+                            <Button variant="outline" size="sm" className="w-full" onClick={() => startReconcile("credit", card.id, card.name)}>
+                              <Sparkles className="mr-1 h-4 w-4" /> Reconcile with statement
+                            </Button>
+                            <p className="text-xs text-[#a1a8b3]">Tip: select all statement page images at once.</p>
                             {included.length === 0 ? (
                               <p className="text-sm text-[#a1a8b3]">No transactions in this billing cycle.</p>
                             ) : (
                               included.map((line) => (
-                                <div key={line.id} className="flex justify-between text-sm">
-                                  <span>{line.label}</span>
+                                <div key={line.id} className="flex items-center justify-between gap-2 text-sm">
+                                  <span className="flex-1">{line.label}</span>
                                   <span>{formatCurrencySymbol(line.amount, currencyCode)}</span>
+                                  <div className="flex gap-2">
+                                    <button onClick={() => openEditExpenseModal(line.expense)} className="text-[#a1a8b3]">
+                                      <Pencil className="h-4 w-4" />
+                                    </button>
+                                    <button onClick={() => deleteExpenseMutation.mutate(line.expense.id)} className="text-[#fb7185]">
+                                      <Trash2 className="h-4 w-4" />
+                                    </button>
+                                  </div>
                                 </div>
                               ))
                             )}
@@ -2167,6 +2438,378 @@ export default function Home() {
         </div>
       )}
 
+      <input
+        ref={reconcileFileInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        className="hidden"
+        onChange={onReconcileFileChange}
+      />
+
+      {reconcile && (() => {
+        const updates = reconcile.changes.filter((change) => change.kind === "update");
+        const adds = reconcile.changes.filter((change) => change.kind === "add");
+        const kept = reconcile.changes.filter((change) => change.kind === "kept");
+        const unchanged = reconcile.changes.filter((change) => change.kind === "unchanged");
+        const locked = reconcile.changes.filter((change) => change.kind === "locked");
+        const actionable = [...updates, ...adds];
+        const selectedApplyCount = actionable.filter((change) => reconcile.selected[change.id]).length;
+        const removeCount = [...kept, ...locked].filter((change) => !reconcile.selected[change.id]).length;
+        const approveCount = selectedApplyCount + removeCount;
+        const showFooter = actionable.length > 0 || kept.length > 0 || locked.length > 0;
+
+        const currentTotal = reconcile.changes.reduce((sum, change) => {
+          if (change.kind === "add") return sum;
+          return sum + (change.tracked?.amount ?? 0);
+        }, 0);
+        const newTotal = reconcile.changes.reduce((sum, change) => {
+          const selected = !!reconcile.selected[change.id];
+          if (change.kind === "add") return selected ? sum + (change.statement?.amount ?? 0) : sum;
+          if (change.kind === "update") {
+            return sum + (selected ? (change.statement?.amount ?? 0) : (change.tracked?.amount ?? 0));
+          }
+          if (change.kind === "kept" || change.kind === "locked") {
+            return selected ? sum + (change.tracked?.amount ?? 0) : sum;
+          }
+          // unchanged always stays
+          return sum + (change.tracked?.amount ?? 0);
+        }, 0);
+        const totalDelta = newTotal - currentTotal;
+
+        const toggle = (id: string) =>
+          setReconcile((prev) => (prev ? { ...prev, selected: { ...prev.selected, [id]: !prev.selected[id] } } : prev));
+
+        const checkbox = (change: ReconcileChange) => (
+          <input
+            type="checkbox"
+            checked={!!reconcile.selected[change.id]}
+            onChange={() => toggle(change.id)}
+            className="mt-1 h-4 w-4 accent-[#22c55e]"
+          />
+        );
+
+        return (
+          <div className="fixed inset-0 z-50 overflow-y-auto bg-[#05070d]/95 px-5 py-4">
+            <div className="mx-auto max-w-2xl space-y-4 pb-32">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold">Reconcile — {reconcile.accountName}</h2>
+                <Button variant="outline" onClick={() => setReconcile(null)} disabled={reconcile.applying}>
+                  Close
+                </Button>
+              </div>
+
+              {reconcile.status === "loading" ? (
+                <Card>
+                  <CardContent className="flex items-center gap-3 p-6">
+                    <Loader2 className="h-5 w-5 animate-spin" />
+                    <span className="text-sm text-[#a1a8b3]">
+                      Analyzing {reconcile.imageCount > 1 ? `${reconcile.imageCount} statement pages` : "statement"} and matching transactions…
+                    </span>
+                  </CardContent>
+                </Card>
+              ) : null}
+
+              {reconcile.status === "error" ? (
+                <Card>
+                  <CardContent className="space-y-3 p-6">
+                    <p className="text-sm text-[#fb7185]">{reconcile.error}</p>
+                    <Button variant="outline" onClick={() => setReconcile(null)}>
+                      Close
+                    </Button>
+                  </CardContent>
+                </Card>
+              ) : null}
+
+              {reconcile.status === "ready" ? (
+                <>
+                  <p className="text-sm text-[#a1a8b3]">
+                    Statement charges found: <span className="font-medium text-[#f3f4f6]">{reconcile.lineItemCount}</span>
+                    {reconcile.imageCount > 1 ? (
+                      <span>
+                        {" "}
+                        from <span className="font-medium text-[#f3f4f6]">{reconcile.imageCount}</span> pages
+                      </span>
+                    ) : null}
+                    . Payments/credits are ignored.
+                  </p>
+
+                  {actionable.length === 0 ? (
+                    <Card>
+                      <CardContent className="p-6">
+                        <p className="text-sm text-[#a1a8b3]">Everything matches the statement. No changes to apply.</p>
+                      </CardContent>
+                    </Card>
+                  ) : null}
+
+                  {updates.length > 0 ? (
+                    <section className="space-y-2">
+                      <p className="px-1 text-xs text-[#a1a8b3]">FIX MISMATCHES ({updates.length})</p>
+                      {updates.map((change) => {
+                        const nameDiffers =
+                          !!change.statement?.description &&
+                          !!change.tracked?.description &&
+                          change.statement.description.trim().toLowerCase() !== change.tracked.description.trim().toLowerCase();
+                        const amountDiffers = Math.abs((change.statement?.amount ?? 0) - (change.tracked?.amount ?? 0)) > 0.01;
+                        const dateDiffers = !!change.statement?.date && change.statement.date !== change.tracked?.expense_date;
+                        return (
+                          <label key={change.id} className="flex cursor-pointer items-start gap-3 rounded-xl border border-[#3a2f14] bg-[#241d10] p-3">
+                            {checkbox(change)}
+                            <div className="flex-1 space-y-1 text-sm">
+                              {nameDiffers ? (
+                                <p className="font-medium">
+                                  <span className="text-[#a1a8b3]">{change.tracked?.description}</span>
+                                  {" → "}
+                                  <span className="text-[#fbbf24]">{change.statement?.description}</span>
+                                </p>
+                              ) : (
+                                <p className="font-medium">{change.statement?.description || change.tracked?.description}</p>
+                              )}
+                              {amountDiffers ? (
+                                <p className="text-[#a1a8b3]">
+                                  {formatCurrencySymbol(change.tracked?.amount ?? 0, currencyCode)}
+                                  {" → "}
+                                  <span className="text-[#fbbf24]">{formatCurrencySymbol(change.statement?.amount ?? 0, currencyCode)}</span>
+                                </p>
+                              ) : (
+                                <p className="text-[#a1a8b3]">{formatCurrencySymbol(change.statement?.amount ?? change.tracked?.amount ?? 0, currencyCode)}</p>
+                              )}
+                              {dateDiffers ? (
+                                <p className="text-xs text-[#a1a8b3]">
+                                  {change.tracked?.expense_date ? formatHistoryDate(change.tracked.expense_date) : "—"}
+                                  {" → "}
+                                  <span className="text-[#fbbf24]">{formatHistoryDate(change.statement!.date!)}</span>
+                                </p>
+                              ) : null}
+                            </div>
+                          </label>
+                        );
+                      })}
+                    </section>
+                  ) : null}
+
+                  {adds.length > 0 ? (
+                    <section className="space-y-2">
+                      <p className="px-1 text-xs text-[#a1a8b3]">ADD MISSING ({adds.length})</p>
+                      {adds.map((change) => (
+                        <label key={change.id} className="flex cursor-pointer items-start gap-3 rounded-xl border border-[#14331f] bg-[#10241a] p-3">
+                          {checkbox(change)}
+                          <div className="flex-1 text-sm">
+                            <p className="font-medium">{change.statement?.description}</p>
+                            <p className="text-[#34d399]">{formatCurrencySymbol(change.statement?.amount ?? 0, currencyCode)}</p>
+                            {change.statement?.date ? (
+                              <p className="text-xs text-[#a1a8b3]">{formatHistoryDate(change.statement.date)}</p>
+                            ) : null}
+                          </div>
+                        </label>
+                      ))}
+                    </section>
+                  ) : null}
+
+                  {kept.length > 0 ? (
+                    <section className="space-y-2">
+                      <p className="px-1 text-xs text-[#a1a8b3]">NOT ON STATEMENT — KEPT ({kept.length})</p>
+                      <p className="px-1 text-xs text-[#a1a8b3]">Uncheck to delete on approve.</p>
+                      {kept.map((change) => (
+                        <label key={change.id} className="flex cursor-pointer items-start gap-3 rounded-xl border border-[#2a2f3a] bg-[#171a23] p-3">
+                          {checkbox(change)}
+                          <div className="flex-1 text-sm">
+                            <p className="font-medium">{change.tracked?.description}</p>
+                            <p className="text-[#a1a8b3]">{formatCurrencySymbol(change.tracked?.amount ?? 0, currencyCode)}</p>
+                            {change.tracked?.expense_date ? (
+                              <p className="text-xs text-[#a1a8b3]">{formatHistoryDate(change.tracked.expense_date)}</p>
+                            ) : null}
+                          </div>
+                        </label>
+                      ))}
+                    </section>
+                  ) : null}
+
+                  {locked.length > 0 ? (
+                    <section className="space-y-2">
+                      <p className="px-1 text-xs text-[#a1a8b3]">INSTALLMENT / RECURRING — NOT CHANGED ({locked.length})</p>
+                      <p className="px-1 text-xs text-[#a1a8b3]">Uncheck to delete on approve.</p>
+                      {locked.map((change) => (
+                        <label key={change.id} className="flex cursor-pointer items-start gap-3 rounded-xl border border-[#2a2f3a] bg-[#171a23] p-3">
+                          {checkbox(change)}
+                          <div className="flex-1 text-sm text-[#a1a8b3]">
+                            <p className="font-medium text-[#f3f4f6]">{change.tracked?.description}</p>
+                            <p>{formatCurrencySymbol(change.tracked?.amount ?? 0, currencyCode)}</p>
+                          </div>
+                        </label>
+                      ))}
+                    </section>
+                  ) : null}
+
+                  {unchanged.length > 0 ? (
+                    <p className="px-1 text-xs text-[#a1a8b3]">{unchanged.length} transaction{unchanged.length === 1 ? "" : "s"} already match the statement.</p>
+                  ) : null}
+
+                  {reconcile.error ? <p className="text-sm text-[#fb7185]">{reconcile.error}</p> : null}
+
+                  {showFooter ? (
+                    <div className="fixed inset-x-0 bottom-0 border-t border-[#2a2f3a] bg-[#05070d] px-5 py-3">
+                      <div className="mx-auto max-w-2xl space-y-2">
+                        <div className="flex items-center justify-between text-sm">
+                          <span className="text-[#a1a8b3]">New total (selected)</span>
+                          <span className="font-semibold">
+                            <span className="text-[#a1a8b3]">{formatCurrencySymbol(currentTotal, currencyCode)}</span>
+                            {" → "}
+                            <span className="text-[#fbbf24]">{formatCurrencySymbol(newTotal, currencyCode)}</span>
+                            {Math.abs(totalDelta) > 0.01 ? (
+                              <span className={`ml-2 text-xs ${totalDelta > 0 ? "text-[#fb7185]" : "text-[#34d399]"}`}>
+                                ({totalDelta > 0 ? "+" : ""}
+                                {formatCurrencySymbol(totalDelta, currencyCode)})
+                              </span>
+                            ) : null}
+                          </span>
+                        </div>
+                        {removeCount > 0 ? (
+                          <p className="text-xs text-[#fb7185]">{removeCount} unchecked item{removeCount === 1 ? "" : "s"} will be deleted.</p>
+                        ) : null}
+                        <div className="flex gap-2">
+                          <Button className="flex-1" onClick={applyReconcile} disabled={reconcile.applying || approveCount === 0}>
+                            {reconcile.applying ? "Applying…" : `Approve (${approveCount})`}
+                          </Button>
+                          <Button variant="outline" onClick={() => setReconcile(null)} disabled={reconcile.applying}>
+                            Cancel
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
+            </div>
+          </div>
+        );
+      })()}
+
+      {expenseModal && (() => {
+        const isEdit = expenseModal.mode === "edit";
+        const paymentType = isEdit ? expenseModal.expense.payment_type : expenseModal.paymentType;
+        const modalCardId = isEdit ? expenseModal.expense.card_id : expenseModal.cardId;
+        const isCredit = paymentType === "credit";
+        const accountName = isCredit ? (cards.find((c) => c.id === modalCardId)?.name ?? "Credit Card") : "Cash";
+        const isInstallment = isEdit ? expenseModal.expense.is_installment : modalIsInstallment;
+        const saving = addExpenseMutation.isPending || updateExpenseMutation.isPending;
+        const selectedDate = parseInputDate(editDate);
+        return (
+          <div className="fixed inset-0 z-60 bg-[#05070d]/95 px-5 py-4">
+            <div className="mx-auto max-w-md space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold">{isEdit ? "Edit Transaction" : `Add to ${accountName}`}</h2>
+                <Button variant="outline" onClick={closeExpenseModal}>Close</Button>
+              </div>
+              <Card>
+                <CardContent className="space-y-3 p-4">
+                  <div className="flex items-center justify-between rounded-xl border border-[#2a2f3a] bg-[#1d212c] px-3 py-2">
+                    <span className="text-xs text-[#a1a8b3]">Account</span>
+                    <span className="text-sm font-medium">{accountName}</span>
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-xs text-[#a1a8b3]">Amount</p>
+                    <Input
+                      type="text"
+                      inputMode="decimal"
+                      value={editAmountDisplay}
+                      onChange={(e) => setEditAmountDisplay(formatAmountDisplay(e.target.value))}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-xs text-[#a1a8b3]">Date</p>
+                    <Popover open={isModalDatePickerOpen} onOpenChange={setIsModalDatePickerOpen}>
+                      <PopoverTrigger asChild>
+                        <Button variant="outline" className="w-full justify-start gap-2 text-left font-normal text-[#a1a8b3]">
+                          <CalendarDays className="h-4 w-4 text-[#7d8596]" />
+                          {editDate || "Pick a date"}
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent align="start" className="w-auto p-0">
+                        <Calendar
+                          mode="single"
+                          selected={selectedDate ?? undefined}
+                          onSelect={(date) => {
+                            if (!date) return;
+                            setEditDate(formatInputDate(date));
+                            setIsModalDatePickerOpen(false);
+                          }}
+                        />
+                      </PopoverContent>
+                    </Popover>
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-xs text-[#a1a8b3]">Description</p>
+                    <Input value={editDescription} onChange={(e) => setEditDescription(e.target.value)} placeholder="e.g. Groceries" />
+                  </div>
+                  {isCredit ? (
+                    <>
+                      {!isEdit ? (
+                        <div className="flex items-center gap-2">
+                          <Switch
+                            checked={modalIsInstallment}
+                            onCheckedChange={(value) => {
+                              setModalIsInstallment(value);
+                              if (value) setEditIsRecurring(false);
+                            }}
+                          />
+                          <span className="text-sm">Installment</span>
+                        </div>
+                      ) : null}
+                      {!isInstallment ? (
+                        <div className="flex items-center gap-2">
+                          <Switch
+                            checked={editIsRecurring}
+                            onCheckedChange={(value) => {
+                              setEditIsRecurring(value);
+                              if (value) setModalIsInstallment(false);
+                            }}
+                          />
+                          <span className="text-sm">Recurring (monthly)</span>
+                        </div>
+                      ) : null}
+                      {isInstallment ? (
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="space-y-1">
+                            <p className="text-xs text-[#a1a8b3]">Tenure (months)</p>
+                            <Input
+                              className={SPINNERLESS_NUMBER_INPUT_CLASS}
+                              type="number"
+                              value={editTenureMonths}
+                              onChange={(e) => setEditTenureMonths(e.target.value)}
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <p className="text-xs text-[#a1a8b3]">Months Paid</p>
+                            <Input
+                              className={SPINNERLESS_NUMBER_INPUT_CLASS}
+                              type="number"
+                              value={editMonthsPaid}
+                              onChange={(e) => setEditMonthsPaid(e.target.value)}
+                            />
+                          </div>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : null}
+                  {editError || (!isEdit && formError) ? (
+                    <p className="text-sm text-[#fb7185]">{editError || formError}</p>
+                  ) : null}
+                  <div className="flex gap-2">
+                    <Button className="flex-1" onClick={saveExpenseModal} disabled={saving}>
+                      {saving ? "Saving..." : isEdit ? "Save Changes" : "Add Transaction"}
+                    </Button>
+                    <Button variant="outline" onClick={closeExpenseModal}>
+                      Cancel
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          </div>
+        );
+      })()}
+
       {balanceDetailType && (
         <div className="fixed inset-0 z-50 bg-[#05070d]/95 px-5 py-4">
           <div className="mx-auto max-w-2xl space-y-4">
@@ -2176,7 +2819,6 @@ export default function Home() {
                 variant="outline"
                 onClick={() => {
                   setBalanceDetailType(null);
-                  setEditingExpenseId(null);
                   setEditError("");
                 }}
               >
@@ -2190,81 +2832,27 @@ export default function Home() {
                 ) : (
                   (balanceDetailType === "installments" ? installmentBalanceItems : recurringBalanceItems).map((entry) => {
                     const item = entry.expense;
-                    const isEditing = editingExpenseId === item.id;
                     const cardName = cards.find((card) => card.id === item.card_id)?.name ?? "Credit Card";
                     return (
                       <div key={entry.id} className="rounded-xl border border-[#2a2f3a] bg-[#1d212c] p-4">
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex-1">
-                            {isEditing ? (
-                              <div className="space-y-2">
-                                <div className="space-y-1">
-                                  <p className="text-xs text-[#a1a8b3]">Description</p>
-                                  <Input value={editDescription} onChange={(e) => setEditDescription(e.target.value)} />
-                                </div>
-                                <div className="space-y-1">
-                                  <p className="text-xs text-[#a1a8b3]">Amount</p>
-                                  <Input type="text" inputMode="decimal" value={editAmountDisplay} onChange={(e) => setEditAmountDisplay(formatAmountDisplay(e.target.value))} />
-                                </div>
-                                <div className="space-y-1">
-                                  <p className="text-xs text-[#a1a8b3]">Card</p>
-                                  <Select value={editCardId || undefined} onValueChange={setEditCardId}>
-                                    <SelectTrigger>
-                                      <SelectValue placeholder="Select Card" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      {cards.map((card) => (
-                                        <SelectItem key={card.id} value={card.id}>
-                                          {card.name}
-                                        </SelectItem>
-                                      ))}
-                                    </SelectContent>
-                                  </Select>
-                                </div>
-                                {item.is_installment && !editIsRecurring ? (
-                                  <div className="grid grid-cols-2 gap-2">
-                                    <div className="space-y-1">
-                                      <p className="text-xs text-[#a1a8b3]">Tenure (months)</p>
-                                      <Input className={SPINNERLESS_NUMBER_INPUT_CLASS} type="number" value={editTenureMonths} onChange={(e) => setEditTenureMonths(e.target.value)} />
-                                    </div>
-                                    <div className="space-y-1">
-                                      <p className="text-xs text-[#a1a8b3]">Months Paid</p>
-                                      <Input className={SPINNERLESS_NUMBER_INPUT_CLASS} type="number" value={editMonthsPaid} onChange={(e) => setEditMonthsPaid(e.target.value)} />
-                                    </div>
-                                  </div>
-                                ) : null}
-                                <div className="flex gap-2">
-                                  <Button size="sm" onClick={() => saveEditingExpense(item)} disabled={updateExpenseMutation.isPending}>
-                                    Save
-                                  </Button>
-                                  <Button size="sm" variant="outline" onClick={cancelEditingExpense}>
-                                    Cancel
-                                  </Button>
-                                </div>
-                              </div>
-                            ) : (
-                              <>
-                                <p className="font-semibold">{item.description}</p>
-                                <p className="text-sm text-[#a1a8b3]">{cardName}</p>
-                                <p className="text-sm text-[#a1a8b3]">{entry.label}</p>
-                              </>
-                            )}
+                            <p className="font-semibold">{item.description}</p>
+                            <p className="text-sm text-[#a1a8b3]">{cardName}</p>
+                            <p className="text-sm text-[#a1a8b3]">{entry.label}</p>
                           </div>
-                          {!isEditing ? (
-                            <div className="text-right">
-                              <p className="font-semibold text-[#fb7185]">-{formatCurrencySymbol(entry.amount, currencyCode)}</p>
-                              <div className="mt-1 flex justify-end gap-2">
-                                <button onClick={() => startEditingExpense(item)} className="text-[#a1a8b3]">
-                                  <Pencil className="h-4 w-4" />
-                                </button>
-                                <button onClick={() => deleteExpenseMutation.mutate(item.id)} className="text-[#fb7185]">
-                                  <Trash2 className="h-4 w-4" />
-                                </button>
-                              </div>
+                          <div className="text-right">
+                            <p className="font-semibold text-[#fb7185]">-{formatCurrencySymbol(entry.amount, currencyCode)}</p>
+                            <div className="mt-1 flex justify-end gap-2">
+                              <button onClick={() => openEditExpenseModal(item)} className="text-[#a1a8b3]">
+                                <Pencil className="h-4 w-4" />
+                              </button>
+                              <button onClick={() => deleteExpenseMutation.mutate(item.id)} className="text-[#fb7185]">
+                                <Trash2 className="h-4 w-4" />
+                              </button>
                             </div>
-                          ) : null}
+                          </div>
                         </div>
-                        {isEditing && editError ? <p className="mt-2 text-sm text-[#fb7185]">{editError}</p> : null}
                       </div>
                     );
                   })
