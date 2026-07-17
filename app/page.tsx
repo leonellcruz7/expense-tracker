@@ -2134,10 +2134,10 @@ export default function Home() {
                             <p className="text-sm text-[#a1a8b3]">No cash transactions in this month.</p>
                           ) : (
                             cashBalance.included.map((line) => (
-                              <div key={line.id} className="flex items-center justify-between gap-2 text-sm">
-                                <span className="flex-1">{line.label}</span>
-                                <span>{formatCurrencySymbol(line.amount, currencyCode)}</span>
-                                <div className="flex gap-2">
+                              <div key={line.id} className="flex min-w-0 items-center justify-between gap-2 text-sm">
+                                <span className="min-w-0 flex-1 truncate">{line.label}</span>
+                                <span className="shrink-0">{formatCurrencySymbol(line.amount, currencyCode)}</span>
+                                <div className="flex shrink-0 gap-2">
                                   <button onClick={() => openEditExpenseModal(line.expense)} className="text-[#a1a8b3]">
                                     <Pencil className="h-4 w-4" />
                                   </button>
@@ -2187,10 +2187,10 @@ export default function Home() {
                               <p className="text-sm text-[#a1a8b3]">No transactions in this billing cycle.</p>
                             ) : (
                               included.map((line) => (
-                                <div key={line.id} className="flex items-center justify-between gap-2 text-sm">
-                                  <span className="flex-1">{line.label}</span>
-                                  <span>{formatCurrencySymbol(line.amount, currencyCode)}</span>
-                                  <div className="flex gap-2">
+                                <div key={line.id} className="flex min-w-0 items-center justify-between gap-2 text-sm">
+                                  <span className="min-w-0 flex-1 truncate">{line.label}</span>
+                                  <span className="shrink-0">{formatCurrencySymbol(line.amount, currencyCode)}</span>
+                                  <div className="flex shrink-0 gap-2">
                                     <button onClick={() => openEditExpenseModal(line.expense)} className="text-[#a1a8b3]">
                                       <Pencil className="h-4 w-4" />
                                     </button>
