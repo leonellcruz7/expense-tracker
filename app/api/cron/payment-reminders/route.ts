@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import nodemailer from "nodemailer";
 
+import { formatCardLabel } from "@/lib/card-last-four";
 import { getSupabaseAdmin } from "@/lib/supabase-admin";
 
 export const dynamic = "force-dynamic";
@@ -10,6 +11,7 @@ type CreditCardRow = {
   id: string;
   user_id: string;
   name: string;
+  last_four: string | null;
   cutoff_day: number;
   payment_deadline_day: number;
 };
@@ -204,7 +206,7 @@ const renderEmailHtml = (dueCards: DueCard[]) => {
           <table role="presentation" style="width:100%;border-collapse:collapse;">
             <tr>
               <td style="vertical-align:top;">
-                <div style="font-size:16px;font-weight:600;color:#111827;">${escapeHtml(card.name)}</div>
+                <div style="font-size:16px;font-weight:600;color:#111827;">${escapeHtml(formatCardLabel(card.name, card.last_four))}</div>
                 <div style="font-size:13px;color:#b45309;margin-top:2px;font-weight:600;">${buildDueLabel(daysUntilDue).toUpperCase()} \u2022 ${deadlineLabel}</div>
                 <div style="font-size:12px;color:#6b7280;margin-top:2px;">${statementLabel}</div>
               </td>
@@ -253,7 +255,7 @@ const renderEmailText = (dueCards: DueCard[]) => {
     const [statementYearStr, statementMonthStr] = statementMonthKey.split("-");
     const deadlineLabel = `${MONTH_NAMES[deadline.getMonth()]} ${deadline.getDate()}, ${deadline.getFullYear()}`;
     const statementLabel = `${MONTH_NAMES[Number(statementMonthStr) - 1]} ${statementYearStr} statement`;
-    lines.push(`${card.name} \u2014 ${formatMoney(balance)}`);
+    lines.push(`${formatCardLabel(card.name, card.last_four)} \u2014 ${formatMoney(balance)}`);
     lines.push(`  ${buildDueLabel(daysUntilDue)} \u2014 ${deadlineLabel} (${statementLabel})`);
     if (items.length > 0) {
       lines.push("  Transactions:");
@@ -322,7 +324,7 @@ const handle = async (request: Request) => {
   const todayKey = `${today.getFullYear()}-${pad2(today.getMonth() + 1)}-${pad2(today.getDate())}`;
 
   const [cardsResult, expensesResult, paymentsResult, remindersResult] = await Promise.all([
-    admin.from("credit_cards").select("id,user_id,name,cutoff_day,payment_deadline_day"),
+    admin.from("credit_cards").select("id,user_id,name,last_four,cutoff_day,payment_deadline_day"),
     admin
       .from("expenses")
       .select(
@@ -387,7 +389,7 @@ const handle = async (request: Request) => {
     try {
       const subject =
         pending.length === 1
-          ? `${pending[0].card.name} payment ${buildDueLabel(pending[0].daysUntilDue)}`
+          ? `${formatCardLabel(pending[0].card.name, pending[0].card.last_four)} payment ${buildDueLabel(pending[0].daysUntilDue)}`
           : `${pending.length} credit card payments due soon`;
 
       await transporter.sendMail({

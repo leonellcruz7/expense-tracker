@@ -31,6 +31,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { formatCardLabel, parseLastFour } from "@/lib/card-last-four";
 import {
   defaultReconcileSelection,
   RECONCILE_AMOUNT_TOLERANCE,
@@ -44,6 +45,7 @@ type PaymentType = "cash" | "credit";
 type CreditCardType = {
   id: string;
   name: string;
+  last_four: string | null;
   cutoff_day: number;
   payment_deadline_day: number;
 };
@@ -143,6 +145,7 @@ const expenseSchema = z
 
 const cardSchema = z.object({
   name: z.string().min(1),
+  last_four: z.string().regex(/^\d{4}$/, "Enter exactly 4 digits"),
   cutoff_day: z.coerce.number().int().min(1).max(31),
   payment_deadline_day: z.coerce.number().int().min(1).max(31),
 });
@@ -297,6 +300,7 @@ export default function Home() {
   const [editIsRecurring, setEditIsRecurring] = useState(false);
   const [editingCardId, setEditingCardId] = useState<string | null>(null);
   const [editCardName, setEditCardName] = useState("");
+  const [editCardLastFour, setEditCardLastFour] = useState("");
   const [editCardCutoffDay, setEditCardCutoffDay] = useState("1");
   const [editCardPaymentDeadlineDay, setEditCardPaymentDeadlineDay] = useState("15");
   const [editError, setEditError] = useState("");
@@ -418,7 +422,7 @@ export default function Home() {
 
   const cardForm = useForm<CardFormValues>({
     resolver: zodResolver(cardSchema),
-    defaultValues: { name: "", cutoff_day: 1, payment_deadline_day: 15 },
+    defaultValues: { name: "", last_four: "", cutoff_day: 1, payment_deadline_day: 15 },
   });
 
   const monthChoices = useMemo(() => monthOptions(), []);
@@ -453,7 +457,7 @@ export default function Home() {
     queryKey: ["cards", profileUserId],
     enabled: authScreen === "app" && !!profileUserId,
     queryFn: async () => {
-      const { data, error } = await supabase.from("credit_cards").select("id,name,cutoff_day,payment_deadline_day").order("created_at", { ascending: true });
+      const { data, error } = await supabase.from("credit_cards").select("id,name,last_four,cutoff_day,payment_deadline_day").order("created_at", { ascending: true });
       if (error) throw error;
       return data as CreditCardType[];
     },
@@ -497,7 +501,7 @@ export default function Home() {
   }, [payments]);
   const cardNameById = useMemo(() => {
     const map = new Map<string, string>();
-    cards.forEach((card) => map.set(card.id, card.name));
+    cards.forEach((card) => map.set(card.id, formatCardLabel(card.name, card.last_four)));
     return map;
   }, [cards]);
   const analysisHistoryQuery = useQuery({
@@ -612,6 +616,7 @@ export default function Home() {
       const { error } = await supabase.from("credit_cards").insert({
         user_id: profileUserId,
         name: parsed.name,
+        last_four: parsed.last_four,
         cutoff_day: parsed.cutoff_day,
         payment_deadline_day: parsed.payment_deadline_day,
       });
@@ -619,7 +624,7 @@ export default function Home() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["cards", profileUserId] });
-      cardForm.reset({ name: "", cutoff_day: 1, payment_deadline_day: 15 });
+      cardForm.reset({ name: "", last_four: "", cutoff_day: 1, payment_deadline_day: 15 });
     },
     onError: (error: Error) => setFormError(error.message),
   });
@@ -702,15 +707,21 @@ export default function Home() {
   });
 
   const updateCardMutation = useMutation({
-    mutationFn: async (values: { id: string; name: string; cutoffDay: number; paymentDeadlineDay: number }) => {
+    mutationFn: async (values: { id: string; name: string; lastFour: string; cutoffDay: number; paymentDeadlineDay: number }) => {
       const parsed = cardSchema.parse({
         name: values.name,
+        last_four: values.lastFour,
         cutoff_day: values.cutoffDay,
         payment_deadline_day: values.paymentDeadlineDay,
       });
       const { error } = await supabase
         .from("credit_cards")
-        .update({ name: parsed.name, cutoff_day: parsed.cutoff_day, payment_deadline_day: parsed.payment_deadline_day })
+        .update({
+          name: parsed.name,
+          last_four: parsed.last_four,
+          cutoff_day: parsed.cutoff_day,
+          payment_deadline_day: parsed.payment_deadline_day,
+        })
         .eq("id", values.id);
       if (error) throw error;
     },
@@ -1164,6 +1175,7 @@ export default function Home() {
   const tenureInput = useWatch({ control: expenseForm.control, name: "tenureMonths" });
   const paidInput = useWatch({ control: expenseForm.control, name: "monthsPaid" });
   const cardNameInput = useWatch({ control: cardForm.control, name: "name" });
+  const cardLastFourInput = useWatch({ control: cardForm.control, name: "last_four" });
   const cardCutoffInput = useWatch({ control: cardForm.control, name: "cutoff_day" });
   const cardPaymentDeadlineInput = useWatch({ control: cardForm.control, name: "payment_deadline_day" });
   const amount = Number(amountInput || 0);
@@ -1188,6 +1200,7 @@ export default function Home() {
   const startEditingCard = (card: CreditCardType) => {
     setEditingCardId(card.id);
     setEditCardName(card.name);
+    setEditCardLastFour(card.last_four ?? "");
     setEditCardCutoffDay(String(card.cutoff_day));
     setEditCardPaymentDeadlineDay(String(card.payment_deadline_day));
     setEditError("");
@@ -1212,10 +1225,18 @@ export default function Home() {
       setEditError("Payment deadline day must be between 1 and 31.");
       return;
     }
+    let lastFour: string;
+    try {
+      lastFour = parseLastFour(editCardLastFour);
+    } catch (error) {
+      setEditError(error instanceof Error ? error.message : "Enter exactly 4 digits.");
+      return;
+    }
     setEditError("");
     updateCardMutation.mutate({
       id: card.id,
       name: trimmedName,
+      lastFour,
       cutoffDay: parsedCutoffDay,
       paymentDeadlineDay: parsedDeadlineDay,
     });
@@ -1718,7 +1739,7 @@ export default function Home() {
                       <SelectContent>
                         <SelectItem value="__none__">Select Card</SelectItem>
                       {cards.map((card) => (
-                        <SelectItem key={card.id} value={card.id}>{card.name}</SelectItem>
+                        <SelectItem key={card.id} value={card.id}>{formatCardLabel(card.name, card.last_four)}</SelectItem>
                       ))}
                       </SelectContent>
                     </Select>
@@ -1808,7 +1829,7 @@ export default function Home() {
                     <SelectItem value={HISTORY_CARD_FILTER_CASH}>Cash</SelectItem>
                     {cards.map((card) => (
                       <SelectItem key={card.id} value={card.id}>
-                        {card.name}
+                        {formatCardLabel(card.name, card.last_four)}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -1837,7 +1858,8 @@ export default function Home() {
               <Card>
                 <CardContent className="space-y-3 p-4">
                   {paginatedExpenses.map((item) => {
-                    const cardName = cards.find((card) => card.id === item.card_id)?.name;
+                    const card = cards.find((entry) => entry.id === item.card_id);
+                    const cardName = card ? formatCardLabel(card.name, card.last_four) : undefined;
                     return (
                       <div key={item.id} className="rounded-xl border border-[#2a2f3a] bg-[#1d212c] p-4">
                         <div className="flex items-start justify-between gap-3">
@@ -1907,7 +1929,7 @@ export default function Home() {
                               <div className="flex flex-1 items-start gap-3">
                                 <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-[#fbbf24]" />
                                 <div className="flex-1">
-                                  <p className="font-medium">{card.name}</p>
+                                  <p className="font-medium">{formatCardLabel(card.name, card.last_four)}</p>
                                   <p className="text-sm text-[#fbbf24]">
                                     {dueLabel} • {deadlineLabel}
                                   </p>
@@ -1958,6 +1980,17 @@ export default function Home() {
                     <Input placeholder="Card name" value={cardNameInput} onChange={(e) => cardForm.setValue("name", e.target.value)} />
                   </div>
                   <div className="space-y-1">
+                    <p className="text-xs text-[#a1a8b3]">Last 4 digits</p>
+                    <Input
+                      inputMode="numeric"
+                      autoComplete="off"
+                      maxLength={4}
+                      placeholder="4242"
+                      value={cardLastFourInput ?? ""}
+                      onChange={(e) => cardForm.setValue("last_four", e.target.value.replace(/\D/g, "").slice(0, 4))}
+                    />
+                  </div>
+                  <div className="space-y-1">
                     <p className="text-xs text-[#a1a8b3]">Cutoff Day</p>
                     <Input className={SPINNERLESS_NUMBER_INPUT_CLASS} type="number" placeholder="1-31" value={String(cardCutoffInput ?? 1)} onChange={(e) => cardForm.setValue("cutoff_day", Number(e.target.value))} />
                   </div>
@@ -1973,6 +2006,9 @@ export default function Home() {
                   </div>
                 </CardContent>
               </Card>
+              {Object.keys(cardForm.formState.errors).length > 0 ? (
+                <p className="text-sm text-[#fb7185]">{Object.values(cardForm.formState.errors)[0]?.message?.toString()}</p>
+              ) : null}
               <Button className="w-full" onClick={cardForm.handleSubmit((values) => addCardMutation.mutate(values))}>Save Card</Button>
 
               <p className="px-1 text-xs text-[#a1a8b3]">SAVED CARDS</p>
@@ -1989,6 +2025,17 @@ export default function Home() {
                               <div className="space-y-1">
                                 <p className="text-xs text-[#a1a8b3]">Card Name</p>
                                 <Input value={editCardName} onChange={(e) => setEditCardName(e.target.value)} />
+                              </div>
+                              <div className="space-y-1">
+                                <p className="text-xs text-[#a1a8b3]">Last 4 digits</p>
+                                <Input
+                                  inputMode="numeric"
+                                  autoComplete="off"
+                                  maxLength={4}
+                                  placeholder="4242"
+                                  value={editCardLastFour}
+                                  onChange={(e) => setEditCardLastFour(e.target.value.replace(/\D/g, "").slice(0, 4))}
+                                />
                               </div>
                               <div className="space-y-1">
                                 <p className="text-xs text-[#a1a8b3]">Cutoff Day</p>
@@ -2016,7 +2063,7 @@ export default function Home() {
                           ) : (
                             <>
                               <div>
-                                <p>{card.name}</p>
+                                <p>{formatCardLabel(card.name, card.last_four)}</p>
                                 <p className="text-sm text-[#a1a8b3]">Cutoff day {card.cutoff_day} • Due day {card.payment_deadline_day}</p>
                               </div>
                               <div className="flex gap-2">
@@ -2204,7 +2251,7 @@ export default function Home() {
                   {monthlyBalances.map(({ card, included, total }) => (
                     <Card key={card.id} className="rounded-xl bg-[#1d212c]">
                       <CardHeader className="flex flex-row items-center justify-between gap-2">
-                        <CardTitle>{card.name}</CardTitle>
+                        <CardTitle>{formatCardLabel(card.name, card.last_four)}</CardTitle>
                         <Button variant="outline" size="sm" onClick={() => openAddExpenseModal("credit", card.id)}>
                           <PlusCircle className="mr-1 h-4 w-4" /> Add
                         </Button>
@@ -2227,7 +2274,7 @@ export default function Home() {
                         {expandedBalanceItems[card.id] ? (
                           <>
                             <Separator />
-                            <Button variant="outline" size="sm" className="w-full" onClick={() => startReconcile("credit", card.id, card.name)}>
+                            <Button variant="outline" size="sm" className="w-full" onClick={() => startReconcile("credit", card.id, formatCardLabel(card.name, card.last_four))}>
                               <Sparkles className="mr-1 h-4 w-4" /> Reconcile with statement
                             </Button>
                             <p className="text-xs text-[#a1a8b3]">Tip: select all statement page images at once.</p>
@@ -2814,7 +2861,10 @@ export default function Home() {
         const paymentType = isEdit ? expenseModal.expense.payment_type : expenseModal.paymentType;
         const modalCardId = isEdit ? expenseModal.expense.card_id : expenseModal.cardId;
         const isCredit = paymentType === "credit";
-        const accountName = isCredit ? (cards.find((c) => c.id === modalCardId)?.name ?? "Credit Card") : "Cash";
+        const accountCard = cards.find((c) => c.id === modalCardId);
+        const accountName = isCredit
+          ? (accountCard ? formatCardLabel(accountCard.name, accountCard.last_four) : "Credit Card")
+          : "Cash";
         const isInstallment = isEdit ? expenseModal.expense.is_installment : modalIsInstallment;
         const saving = addExpenseMutation.isPending || updateExpenseMutation.isPending;
         const selectedDate = parseInputDate(editDate);
@@ -2827,10 +2877,28 @@ export default function Home() {
               </div>
               <Card>
                 <CardContent className="space-y-3 p-4">
-                  <div className="flex items-center justify-between rounded-xl border border-[#2a2f3a] bg-[#1d212c] px-3 py-2">
-                    <span className="text-xs text-[#a1a8b3]">Account</span>
-                    <span className="text-sm font-medium">{accountName}</span>
-                  </div>
+                  {isEdit && isCredit ? (
+                    <div className="space-y-1">
+                      <p className="text-xs text-[#a1a8b3]">Account</p>
+                      <Select value={editCardId || undefined} onValueChange={setEditCardId}>
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select Card" />
+                        </SelectTrigger>
+                        <SelectContent className="z-70">
+                          {cards.map((card) => (
+                            <SelectItem key={card.id} value={card.id}>
+                              {formatCardLabel(card.name, card.last_four)}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  ) : (
+                    <div className="flex items-center justify-between rounded-xl border border-[#2a2f3a] bg-[#1d212c] px-3 py-2">
+                      <span className="text-xs text-[#a1a8b3]">Account</span>
+                      <span className="text-sm font-medium">{accountName}</span>
+                    </div>
+                  )}
                   <div className="space-y-1">
                     <p className="text-xs text-[#a1a8b3]">Amount</p>
                     <Input
@@ -2956,7 +3024,8 @@ export default function Home() {
                 ) : (
                   (balanceDetailType === "installments" ? installmentBalanceItems : recurringBalanceItems).map((entry) => {
                     const item = entry.expense;
-                    const cardName = cards.find((card) => card.id === item.card_id)?.name ?? "Credit Card";
+                    const card = cards.find((entry) => entry.id === item.card_id);
+                    const cardName = card ? formatCardLabel(card.name, card.last_four) : "Credit Card";
                     return (
                       <div key={entry.id} className="rounded-xl border border-[#2a2f3a] bg-[#1d212c] p-4">
                         <div className="flex items-start justify-between gap-3">
